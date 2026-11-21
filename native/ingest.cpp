@@ -781,11 +781,73 @@ inline uint32_t filterHash(Key id) {
         return static_cast<uint32_t>(id.hash());
     return _mm_crc32_u64(0, id.bits);
 }
+// Catalog the short contiguous ID blocks once. A slot holds an index into
+// that catalog plus a hash fingerprint; exact ties always compare the keys.
+bool compactOwners(size_t shard, size_t count, int64_t origin, const Source& source,
+                   std::vector<std::unique_ptr<Reader>>& readers) {
+    struct Piece { const IdRecord* rows; Reader* reader; size_t count; };
+    static thread_local std::vector<Piece> pieces;
+    pieces.clear();
+    for (auto& reader : readers)
+        reader->ids.pieces(shard, [&](const IdRecord* rows, size_t n) {
+            pieces.push_back({rows, reader.get(), n});
+        });
+
+    constexpr size_t stride = rowsPerBlock<IdRecord>;
+    static_assert(std::has_single_bit(stride));
+    // Preserve a useful fingerprint. Unusually large domains use the fully
+    // general two-pass implementation below.
+    if (pieces.size() >= (size_t{1} << 25) / stride) return false;
+    const unsigned handleBits = std::bit_width(pieces.size() * stride);
+    const uint32_t handleMask = (uint32_t{1} << handleBits) - 1;
+    static thread_local std::vector<uint32_t> owners;
+    owners.assign(std::bit_ceil(count * 2), 0);
+    const uint32_t slotMask = static_cast<uint32_t>(owners.size() - 1);
+    const unsigned slotBits = std::countr_zero(owners.size());
+
+    for (size_t block = 0; block < pieces.size(); ++block) {
+        const auto& piece = pieces[block];
+        for (size_t i = 0; i < piece.count; ++i) {
+            const IdRecord& row = piece.rows[i];
+            const uint32_t hash = filterHash(row.id);
+            const uint32_t tag = ((hash >> slotBits) * 0x9e3779b1u) & ~handleMask;
+            const uint32_t current = tag | static_cast<uint32_t>(block * stride + i + 1);
+            uint32_t at = hash & slotMask;
+            for (unsigned probe = 0; ; ++probe, at = (at + 1) & slotMask) {
+                // A pathological CRC cluster can use the full-key hashing path.
+                // Every loser marked so far already lost an exact comparison.
+                if (probe == 48) return false;
+                const uint32_t old = owners[at];
+                if (!old) {
+                    owners[at] = current;
+                    break;
+                }
+                if ((old & ~handleMask) != tag) continue;
+                const uint32_t ref = (old & handleMask) - 1;
+                const auto& priorPiece = pieces[ref / stride];
+                const auto& prior = priorPiece.rows[ref % stride];
+                if (!(prior.id == row.id)) continue;
+                const bool inlineTimes = (uint32_t(row.info) | uint32_t(prior.info)) < sourceTag;
+                const bool earlier = inlineTimes ? (row.info >> 32) < (prior.info >> 32)
+                    : arrival(row.info,*piece.reader,source,origin) <
+                      arrival(prior.info,*priorPiece.reader,source,origin);
+                if (earlier) {
+                    invalidate(prior.info, *priorPiece.reader);
+                    owners[at] = current;
+                } else {
+                    invalidate(row.info, *piece.reader);
+                }
+                break;
+            }
+        }
+    }
+    return true;
+}
 void deduplicate(size_t shard, int64_t arrivalOrigin, const Source& source,
                  std::vector<std::unique_ptr<Reader>>& readers) {
     size_t count = 0;
     for (auto& r : readers) count += r->ids.count(shard);
-    if (count < 2) return;
+    if (count < 2 || compactOwners(shard, count, arrivalOrigin, source, readers)) return;
     const size_t bits = std::clamp<size_t>(std::bit_ceil(count)*16,64,1u<<23);
     const size_t mask = bits-1;
     struct Word { uint64_t seen, repeated; };
@@ -956,6 +1018,12 @@ void ingest(const Context& ctx, const std::vector<std::string_view>& eventFiles,
                         const uint32_t index = reader.events.add(bucket,Event::pack(event.user,ctx.start,event.row));
                         info = location(reader,event.arrival,arrivalOrigin,bucket,index);
                     } else {
+                        // A row rejected before timestamp validation can still be the
+                        // earliest copy. Cache its arrival while the CSV is resident.
+                        if (event.arrival == invalidTime) {
+                            std::array<std::string_view,7> fields;
+                            if (eventFields(line, fields)) event.arrival = ingestTime(fields[3]);
+                        }
                         const uint64_t relative = relativeArrival(event.arrival,arrivalOrigin);
                         info = event.arrival != invalidTime && relative <= UINT32_MAX
                              ? (relative << 32) | invalidArrivalTag : special(offset,sourceTag);
@@ -984,6 +1052,14 @@ void ingest(const Context& ctx, const std::vector<std::string_view>& eventFiles,
     });
     lap("parse");
 
+    // Release file-backed page table entries alongside deduplication. Long
+    // keys and exceptional arrivals can still fault their source pages back in.
+    std::jthread releaseInput([&] {
+        for (const auto *files : {&eventFiles, &clickFiles})
+            for (auto f : *files)
+                if (!f.empty())
+                    madvise(const_cast<char *>(f.data()), f.size(), MADV_DONTNEED);
+    });
     parallel(idShards, workers, [&](size_t shard) {
         deduplicate(shard, arrivalOrigin, source, readers);
         std::vector<void*> spent;
@@ -991,14 +1067,6 @@ void ingest(const Context& ctx, const std::vector<std::string_view>& eventFiles,
         recycled.give(spent);
     });
     lap("dedup");
-    // Drop the file-backed PTEs after the last source reread. Borrowed keys
-    // remain valid because the read-only mappings themselves stay in place.
-    std::jthread releaseInput([&] {
-        for (const auto *files : {&eventFiles, &clickFiles})
-            for (auto f : *files)
-                if (!f.empty())
-                    madvise(const_cast<char *>(f.data()), f.size(), MADV_DONTNEED);
-    });
     awaitIdentities();
     lap("await-links");
 

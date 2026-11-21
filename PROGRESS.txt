@@ -4,8 +4,8 @@ Updated 2026-11-21, Asia/Kolkata
 Submission and targets
 [x] Start the attributed C++ branch from public revision dd510ea. Verify
     both output tables on 49 reference datasets and two further edge cases.
-[ ] Compare candidate builds on 20M and 60M events and publish the measured
-    revision. The sub-0.500 s target will require a portal result.
+[x] Compare candidate builds on 20M and 60M events. The selected revision
+    is on perf/public-cpp. Its portal score is pending.
 [x] Implement the rules and publish the original solution, d6783e0.
     The team reported 8 seconds and rank 178.
 [x] Publish 36e2f49. The team reported 1.52 seconds on the practice portal.
@@ -17,9 +17,32 @@ Submission and targets
 [x] Submit 0746b3d. The team reported 1.05 seconds on the practice portal.
 [ ] Measure bba2a13 on the portal against 0746b3d. The trial caps CPU
     selection at x86-64-v3 and uses the same solver source as the control.
-[ ] Reach a 20M local container start-to-exit median below 1.000 second.
+[x] Reach a 20M local container start-to-exit median below 1.000 second.
+    The packaged C++ fork reached 0.937 s on seed 67159043 and 0.973 s on
+    seed 271828. Each median uses four fresh containers after input warmup.
     The 1.08 s submission had local warm medians of 1.471, 1.514 and 1.440 s.
 [ ] Beat 0.500 s on the next portal submission. Longer-term target: 0.300 s.
+
+C++ submission on perf/public-cpp
+[x] Package the attributed native pipeline for x86-64-v3 and use the
+    existing portable Rust solver on older amd64 processors.
+[x] Resolve each redirected shopper to its canonical name, index duplicate
+    events with compact row handles, and record discarded copies' arrival
+    times while their source rows are still resident.
+[x] Train the compiler with synthetic linked shoppers, uneven activity,
+    timestamp variants, quoted fields, and multiple input files.
+[x] Pass nine native C++ test programs and both output comparisons on all
+    36 official fixtures, the dev answer, and 14 further reference inputs.
+    Check the packaged launcher and both outputs on three emulated CPUs.
+[x] Time the release in fresh, network-isolated containers with eight
+    pinned logical CPUs and 6 GiB. The reserved 20M seed 67159043 and
+    the second 20M seed 271828 gave medians of 0.937 and 0.973 s. The
+    1.05 s Rust submission took 1.517 and 1.317 s in the same batches.
+    At 60M events and 15M clicks, seed 99, the release took 4.202, 4.046
+    and 4.462 s from start to exit, a median of 4.202 s.
+[x] Match both complete tables by key and column on all three timed
+    datasets. The user/day tables contain 2,237,170, 2,250,629 and
+    6,648,247 rows respectively. Each campaign/day table has 28,014 rows.
 
 Submission candidate with fused event parsing and a smaller identity table
 [x] Store one decreasing edge for each redirected key, resolve conflicting

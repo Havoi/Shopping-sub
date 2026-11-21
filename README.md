@@ -12,6 +12,15 @@ at revision `dd510eadd036edcc10af568ad6dd3d656ae98f73`. Its copyright
 and MIT permission notice are retained in [native/LICENSE](native/LICENSE)
 and in the runtime image. The C++ build uses GCC, jemalloc and LZ4.
 
+The native linker stores each redirected shopper ID once. It resolves
+conflicting links to the same bytewise-minimum name before routing events.
+The event deduplicator indexes rows by compact handles and compares the full
+event ID before choosing the earliest arrival. It records the arrival of
+discarded events while the input is still in cache, so those copies can
+still win deduplication. Large partitions and long probe chains use the
+general deduplicator. Compiler training uses synthetic inputs created during
+the build.
+
 The image starts a compiled executable with no arguments. Dependencies are
 installed during the build. Runtime diagnostics go to stderr. Input dates,
 identities, products, campaigns, and file counts all come from the mounted data.

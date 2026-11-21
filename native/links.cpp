@@ -235,132 +235,100 @@ void fallbackLinks(const std::vector<std::string_view> &files, Context &ctx, uns
     });
 }
 
-void linkPeople(const std::vector<std::string_view> &files, Context &ctx, unsigned workers) {
+void linkPeople(const std::vector<std::string_view>& files, Context& ctx, unsigned workers) {
     auto chunks = batches(files);
     size_t rows = 0;
-    for (const auto &b : chunks)
-        rows += std::count(b.rows.begin(), b.rows.end(), '\n') + 1;
-    if (!rows)
-        return;
-    const size_t cap = std::bit_ceil(std::max<size_t>(32, rows / shards * 2 + rows / shards / 4 + 64));
-    if (cap > UINT32_MAX / shards) {
-        fallbackLinks(files, ctx, workers);
-        return;
-    }
-    auto &dict = ctx.identities;
+    for (const auto& chunk : chunks)
+        rows += std::count(chunk.rows.begin(), chunk.rows.end(), '\n') + 1;
+    if (!rows) return;
+
+    auto& dict = ctx.identities;
+    const size_t cap = std::bit_ceil(std::max<size_t>(32, rows / shards * 2 + 64));
     dict.shardSize = cap;
     dict.slotShift = 64 - Identities::shardBits - std::countr_zero(cap);
     dict.slots.resize(cap * shards);
-    std::atomic<bool> overflow = false;
     const uint64_t empty = Key{}.bits;
-    auto intern = [&](Key key, uint64_t h) -> uint32_t {
-        const size_t base = Identities::shard(h) * cap;
-        size_t pos = dict.home(h);
-        for (size_t steps = 0; steps < cap; ++steps, pos = (pos + 1) & (cap - 1)) {
-            auto idx = base + pos;
-            auto slot = std::atomic_ref<uint64_t>(dict.slots[idx].raw.bits);
-            uint64_t existing = slot.load(std::memory_order_acquire);
-            if (existing == empty &&
-                slot.compare_exchange_strong(existing, key.bits, std::memory_order_acq_rel,
-                                             std::memory_order_acquire))
-                return static_cast<uint32_t>(idx);
-            if (Key{existing} == key)
-                return static_cast<uint32_t>(idx);
-        }
-        overflow.store(true, std::memory_order_relaxed);
-        return UINT32_MAX;
-    };
-    auto root = [&](uint32_t i) {
-        for (;;) {
-            auto cur = std::atomic_ref<uint64_t>(dict.slots[i].name.bits);
-            auto n = cur.load(std::memory_order_relaxed);
-            if (n == empty)
-                return i;
-            auto g = std::atomic_ref<uint64_t>(dict.slots[n].name.bits).load(std::memory_order_relaxed);
-            if (g != empty)
-                cur.compare_exchange_weak(n, g, std::memory_order_relaxed);
-            i = static_cast<uint32_t>(n);
-        }
-    };
-    auto merge = [&](uint32_t a, uint32_t b) {
-        if (a == UINT32_MAX || b == UINT32_MAX)
-            return;
-        while (a != b) {
-            a = root(a);
-            b = root(b);
-            if (a == b)
+    std::atomic<bool> full{false};
+
+    // Insert one edge per non-root spelling. If that spelling already has a
+    // parent, connecting its parent to the new neighbour preserves the union.
+    // The larger spelling strictly decreases on every retry.
+    auto join = [&](Key a, Key b) {
+        while (!(a == b)) {
+            if (a < b) std::swap(a, b);
+            const auto h = a.hash();
+            const size_t base = Identities::shard(h) * cap;
+            size_t pos = dict.home(h);
+            bool found = false;
+            for (size_t step = 0; step < cap; ++step, pos = (pos + 1) & (cap - 1)) {
+                auto& entry = dict.slots[base + pos];
+                auto key = std::atomic_ref(entry.raw.bits);
+                uint64_t observed = key.load(std::memory_order_relaxed);
+                if (observed == empty)
+                    key.compare_exchange_strong(observed, a.bits, std::memory_order_relaxed);
+                if (observed != empty && !(Key{observed} == a)) continue;
+                auto parent = std::atomic_ref(entry.name.bits);
+                uint64_t previous = empty;
+                if (parent.compare_exchange_strong(previous, b.bits, std::memory_order_relaxed)) return;
+                a = Key{previous};
+                found = true;
                 break;
-            Key ka{std::atomic_ref<uint64_t>(dict.slots[a].raw.bits).load(std::memory_order_acquire)};
-            Key kb{std::atomic_ref<uint64_t>(dict.slots[b].raw.bits).load(std::memory_order_acquire)};
-            if (kb < ka)
-                std::swap(a, b);
-            uint64_t expected = empty;
-            if (std::atomic_ref<uint64_t>(dict.slots[b].name.bits)
-                    .compare_exchange_weak(expected, a, std::memory_order_relaxed))
-                break;
+            }
+            if (!found) {
+                full.store(true, std::memory_order_relaxed);
+                return;
+            }
         }
     };
     parallel(chunks.size(), workers, [&](size_t i) {
-        struct Pair {
-            Key a, b;
-            uint64_t ha, hb;
-        };
-        std::array<Pair, 32> batch;
-        size_t used = 0;
-        auto flush = [&] {
-            for (size_t j = 0; j < used; ++j) {
-                const auto &e = batch[j];
-                merge(intern(e.a, e.ha), intern(e.b, e.hb));
-            }
-            used = 0;
-        };
-        linkRows(chunks[i].rows, [&](Key a, Key b) {
-            if (a == b || overflow.load(std::memory_order_relaxed))
-                return;
-            uint64_t ha = a.hash(), hb = b.hash();
-            __builtin_prefetch(&dict.slots[Identities::shard(ha) * cap + dict.home(ha)], 1);
-            __builtin_prefetch(&dict.slots[Identities::shard(hb) * cap + dict.home(hb)], 1);
-            batch[used++] = {a, b, ha, hb};
-            if (used == batch.size())
-                flush();
-        });
-        flush();
+        linkRows(chunks[i].rows, [&](Key a, Key b) { join(a,b); });
     });
-    if (overflow.load(std::memory_order_relaxed)) {
-        dict.slots.clear();
+
+    // Normal lookup terminates on an empty slot even for an absent key.
+    for (size_t s = 0; s < shards && !full.load(std::memory_order_relaxed); ++s) {
+        auto begin = dict.slots.begin() + s * cap;
+        if (std::none_of(begin, begin + cap, [](const auto& entry) { return entry.raw.empty(); }))
+            full.store(true, std::memory_order_relaxed);
+    }
+    if (full.load(std::memory_order_relaxed)) {
+        dict = {};
         fallbackLinks(files, ctx, workers);
         return;
     }
-    std::array<std::vector<Identities::Alias>, shards> aliases;
-    parallel(shards, workers, [&](size_t s) {
-        auto &out = aliases[s];
-        for (size_t i = s * cap; i < (s + 1) * cap; ++i) {
-            if (dict.slots[i].raw.empty())
-                continue;
-            auto r = root(static_cast<uint32_t>(i));
-            if (r != i)
-                out.push_back({dict.slots[i].raw, dict.slots[r].raw});
-        }
-    });
-    size_t biggest = 0;
-    for (auto &out : aliases)
-        biggest = std::max(biggest, out.size());
-    std::vector<Identities::Alias>().swap(dict.slots);
-    if (!biggest)
-        return;
-    dict.shardSize = std::bit_ceil(biggest + biggest / 2 + 1);
-    dict.slotShift = 64 - Identities::shardBits - std::countr_zero(dict.shardSize);
-    dict.slots.resize(shards * dict.shardSize);
+
     dict.fingerprints.resize(dict.slots.size());
+    auto lookup = [&](Key key) -> Identities::Alias* {
+        const uint64_t h = key.hash();
+        auto* table = dict.slots.data() + Identities::shard(h) * cap;
+        size_t pos = dict.home(h);
+        while (!table[pos].raw.empty()) {
+            if (table[pos].raw == key) return table + pos;
+            pos = (pos + 1) & (cap - 1);
+        }
+        return nullptr;
+    };
     parallel(shards, workers, [&](size_t s) {
-        const size_t base = s * dict.shardSize, mask = dict.shardSize - 1;
-        for (auto x : aliases[s]) {
-            auto h = x.raw.hash();
-            auto pos = dict.home(h);
-            dict.fingerprints[base + pos] |= Identities::fingerprint(h);
-            while (!dict.slots[base + pos].raw.empty())
-                pos = (pos + 1) & mask;
-            dict.slots[base + pos] = x;
+        const size_t base = s * cap;
+        for (size_t i = 0; i < cap; ++i) {
+            auto& entry = dict.slots[base + i];
+            if (entry.raw.empty()) continue;
+            auto parent = std::atomic_ref(entry.name.bits);
+            Key root{parent.load(std::memory_order_relaxed)};
+            while (auto* next = lookup(root)) {
+                auto grand = std::atomic_ref(next->name.bits);
+                root = Key{grand.load(std::memory_order_relaxed)};
+                // Path halving bounds the work on long descending chains.
+                if (auto* following = lookup(root)) {
+                    // Another worker may already have resolved this entry. Only
+                    // shorten the edge whose old parent we actually observed.
+                    uint64_t previous = root.bits;
+                    root = Key{std::atomic_ref(following->name.bits).load(std::memory_order_relaxed)};
+                    grand.compare_exchange_strong(previous, root.bits, std::memory_order_relaxed);
+                }
+            }
+            parent.store(root.bits, std::memory_order_relaxed);
+            const uint64_t hash = entry.raw.hash();
+            dict.fingerprints[base + dict.home(hash)] |= Identities::fingerprint(hash);
         }
     });
 }
