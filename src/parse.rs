@@ -57,7 +57,31 @@ struct Structural {
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx2",
-    target_feature = "bmi2"
+    target_feature = "bmi2",
+    target_feature = "avx512bw"
+))]
+#[inline(always)]
+fn classify(block: &[u8; 64]) -> Structural {
+    use std::arch::x86_64::*;
+    // The caller has checked all 64 bytes, including unaligned input.
+    unsafe {
+        let bytes = _mm512_loadu_si512(block.as_ptr().cast());
+        let newlines = _mm512_cmpeq_epi8_mask(bytes, _mm512_set1_epi8(b'\n' as i8));
+        let commas = _mm512_cmpeq_epi8_mask(bytes, _mm512_set1_epi8(b',' as i8));
+        let quotes = _mm512_cmpeq_epi8_mask(bytes, _mm512_set1_epi8(b'"' as i8));
+        Structural {
+            separators: commas | newlines,
+            newlines,
+            quotes,
+        }
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "bmi2",
+    not(target_feature = "avx512bw")
 ))]
 #[inline(always)]
 fn classify(block: &[u8; 64]) -> Structural {
@@ -73,7 +97,8 @@ fn classify(block: &[u8; 64]) -> Structural {
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx2",
-    target_feature = "bmi2"
+    target_feature = "bmi2",
+    not(target_feature = "avx512bw")
 ))]
 #[inline(always)]
 fn classify32(block: &[u8; 32]) -> Structural {
@@ -192,13 +217,19 @@ impl<'a, const N: usize> Iterator for FastRows<'a, N> {
             if N < 32 && data.len() >= 128 {
                 let a = classify(data[..64].try_into().unwrap());
                 let (sep, quotes, len) = if a.newlines == 0 {
-                    let mut b = classify32(data[64..96].try_into().unwrap());
-                    if b.newlines == 0 {
-                        let last = classify32(data[96..128].try_into().unwrap());
-                        b.newlines |= last.newlines << 32;
-                        b.quotes |= last.quotes << 32;
-                        b.separators |= last.separators << 32;
-                    }
+                    #[cfg(target_feature = "avx512bw")]
+                    let b = classify(data[64..128].try_into().unwrap());
+                    #[cfg(not(target_feature = "avx512bw"))]
+                    let b = {
+                        let mut b = classify32(data[64..96].try_into().unwrap());
+                        if b.newlines == 0 {
+                            let last = classify32(data[96..128].try_into().unwrap());
+                            b.newlines |= last.newlines << 32;
+                            b.quotes |= last.quotes << 32;
+                            b.separators |= last.separators << 32;
+                        }
+                        b
+                    };
                     (
                         (a.separators as u128) | ((b.separators as u128) << 64),
                         (a.quotes as u128) | ((b.quotes as u128) << 64),

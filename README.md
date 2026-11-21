@@ -12,7 +12,7 @@ identities, products, campaigns, and file counts all come from the mounted data.
 ## Build and run
 
 Use Linux or WSL with Docker. The linux/amd64 image selects its CPU target at
-startup. It includes a build for x86-64-v3 with AES and a generic amd64 build.
+startup. It includes x86-64-v4 and x86-64-v3 builds with AES, and a generic amd64 build.
 
 ```sh
 make build
@@ -67,6 +67,21 @@ python3 scripts/compare.py /path/to/output42 /path/to/expected42
 
 CSV, timestamp, identity and compact-record unit checks are available with `make test` when Rust 1.85 or later is
 installed. `Cargo.lock` pins the dependency graph used by the Docker build.
+
+## AVX-512 portal comparison
+
+This branch adds a third executable for CPUs supporting x86-64-v4 and AES.
+Its CSV scanner compares each 64-byte block against comma, newline and quote
+bytes using AVX-512BW mask registers. The launcher checks CPU and OS support
+before selecting it. Other amd64 machines use the existing v3 or generic
+executable.
+
+The v4 solver matched both tables on all 36 fixtures under Intel Software
+Development Emulator. On the packaged image we traced the launcher selecting
+the v4 executable, passed all 36 fixtures, and matched every public 1M
+row. The native v3 fallback matched the same public answer. The local CPU
+has AVX2. Native AVX-512 speed needs a portal run; the table below measures
+the primary release.
 
 ## Current release benchmark
 
