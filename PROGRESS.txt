@@ -20,11 +20,12 @@ Updated 2026-11-21, Asia/Kolkata
 [x] Check image and submission source sizes.
 [x] Initialize the local Git repository with generated data excluded.
 [x] Finish the verification summary and record remaining limitations.
-[ ] Publish a public GitHub repository and submit a commit to the scorer.
+[ ] Publish the verified solution to Havoi/Shopping-sub.
+[ ] Submit a commit to the competition scorer.
 
 Current status
-Local implementation and verification are complete. Public publication and
-competition scoring are pending a repository destination and submission.
+Local implementation and verification are complete. Publication to the public
+Havoi/Shopping-sub repository is in progress. Competition scoring is pending.
 
 Final-image benchmarks
 20M events and 5M clicks, seed 2026
@@ -40,6 +41,15 @@ Final-image benchmarks
 Both used 8 pinned CPU threads, a 6 GiB container memory limit, no swap,
 uid 1000, read-only root and inputs, and disabled networking. The scorer
 provides 24 GiB. Local laptop timings do not establish hidden scorer times.
+
+Portal timing estimate
+A fresh 20M rerun completed in 14.13 seconds of Docker CLI wall time and
+12.779 seconds inside the pipeline, close to the previous 13.93-second run.
+The laptop uses a Ryzen 5 5600H. The selected WSL CPU set reports 8 threads
+across 4 cores. The portal uses Intel Xeon N2 hardware and a different seed.
+The engineering estimate is about 20 seconds, with a planning range of
+15 to 30 seconds. CPU, storage/cache state, and seed differences remain
+unmeasured on the portal. This estimate covers the scored execution.
 
 Correctness verification
 The final image passed all 36 supplied fixtures through its normal entry
