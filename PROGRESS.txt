@@ -6,9 +6,21 @@ Submission and targets
     The team reported 8 seconds and rank 178.
 [x] Publish 36e2f49. The team reported 1.52 seconds on the practice portal.
 [x] Publish b45f23d. The team reported 1.17 seconds on the practice portal.
+[x] Publish 9a8f5a0. The team reported 1.08 seconds on the practice portal.
 [ ] Reach a 20M local container start-to-exit median below 1.000 second.
     Current 20M warm medians are 1.471, 1.514 and 1.440 s on this machine.
-[ ] Reach <0.300 s on the portal.
+[ ] Beat 0.500 s on the next portal submission. Longer-term target: 0.300 s.
+
+[x] Publish b86512b on perf/worker-reuse. All 36 official fixtures and 13
+    reference datasets matched, as did all rows on three 20M inputs and one
+    60M input. At 60M the median of three fresh, 6 GiB containers fell from
+    7.536 to 6.243 s, with a 19.591 s first run for the candidate. Practice
+    gains varied by seed and trial. Its portal time is unmeasured.
+[x] Confirm the choice on a new 20M-event, 5M-click input (seed 46091337).
+    Four fresh containers per build after warmup: median 1.308 s for the
+    scored 9a8f5a0 and 1.243 s for b86512b. All 2,230,398 user/day and
+    28,014 campaign/day rows match. The local ratio scaled to 1.08 s gives
+    1.03 s. Reaching 0.500 s would require a 53.7% reduction from 1.08 s.
 
 Release verification
 [x] Benchmark routing events to final shards during parsing. Waiting for links
