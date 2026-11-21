@@ -625,6 +625,55 @@ inline void prepMasks(std::string_view s, PreparedMasks &packed) {
     mt.quote >>= 2;
     saveMasks(packed, mh, mm, mt);
 }
+#ifdef __AVX512BW__
+template <class F> void eventLines(const InputChunk &chunk, F &&visit) {
+    const char* p = chunk.file.data() + chunk.begin;
+    const char* finish = chunk.file.data() + chunk.end;
+    const char* limit = chunk.file.data() + chunk.file.size();
+    if (!chunk.begin || p[-1] != '\n') {
+        const char* first = static_cast<const char*>(std::memchr(p, '\n', finish-p));
+        if (!first) return;
+        p = first+1;
+    }
+    // GCC can otherwise rematerialize all three broadcasts for each row.
+    // Keep one vector constant per delimiter for both vector widths.
+    __m512i nl = _mm512_set1_epi8('\n'), cm = _mm512_set1_epi8(','), qt = _mm512_set1_epi8('"');
+    asm("" : "+v"(nl), "+v"(cm), "+v"(qt));
+    constexpr uint32_t low30 = 0x3fffffffu;
+    while (p < finish) {
+        if (limit - p >= 94) {
+            // The overlapping windows cover the first 94 bytes. Once the
+            // newline is located, the 64-bit masks provide both remaining
+            // fields, including a tail that crosses a 32-byte boundary.
+            const __m256i head = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+            const __m512i rest = _mm512_loadu_si512(p+30);
+            const uint32_t early = _mm256_movemask_epi8(_mm256_cmpeq_epi8(head,_mm512_castsi512_si256(nl)));
+            const uint64_t newlines = _mm512_cmpeq_epi8_mask(rest,nl);
+            const unsigned end = std::countr_zero(newlines);
+            if (!(early & low30) && end-31 <= 31) {
+                const uint64_t commas = _mm512_cmpeq_epi8_mask(rest,cm);
+                const uint64_t quotes = _mm512_cmpeq_epi8_mask(rest,qt);
+                const uint32_t ch = _mm256_movemask_epi8(_mm256_cmpeq_epi8(head,_mm512_castsi512_si256(cm)));
+                const uint32_t qh = _mm256_movemask_epi8(_mm256_cmpeq_epi8(head,_mm512_castsi512_si256(qt)));
+                const unsigned shift = end-30;
+                const size_t n = 30+end;
+                auto& row = visit();
+                row.line = {p,n};
+                saveMasks(row, {ch & low30,qh & low30},
+                               {uint32_t(commas),uint32_t(quotes)},
+                               {uint32_t(commas >> shift) & low30,uint32_t(quotes >> shift) & low30});
+                p += n+1;
+                continue;
+            }
+        }
+        const char* end = static_cast<const char*>(std::memchr(p,'\n',limit-p));
+        if (!end) end = limit;
+        prepMasks({p, size_t(end-p)},visit());
+        if (end == limit) break;
+        p = end+1;
+    }
+}
+#else
 template <class F> void eventLines(const InputChunk &chunk, F &&visit) {
     const char *p = chunk.file.data() + chunk.begin;
     const char *finish = chunk.file.data() + chunk.end;
@@ -671,6 +720,7 @@ template <class F> void eventLines(const InputChunk &chunk, F &&visit) {
         p = end + 1;
     }
 }
+#endif
 inline bool parsePrepared(const PreparedMasks &packed, const Context &ctx, ParsedEvent &out) {
     auto s = packed.line;
     const size_t n = s.size();

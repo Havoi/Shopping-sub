@@ -1,8 +1,9 @@
 # Shopping Sessions
 
-This branch runs a C++20 Shopping Sessions pipeline on x86-64-v3 hardware
-and the team's Rust implementation on older amd64 machines. It reads the
-mounted CSV inputs, resolves linked IDs, and writes both required Parquet tables.
+This branch selects an AVX-512 C++20 pipeline on x86-64-v4 CPUs, an AVX2
+C++20 pipeline on x86-64-v3 CPUs, and the team's Rust implementation on
+older amd64 machines. It reads the mounted CSV inputs, resolves linked IDs,
+and writes both required Parquet tables.
 The exact behavior is specified in [rules.md](rules.md). Current verification
 results and remaining work are recorded in [PROGRESS.txt](PROGRESS.txt).
 
@@ -35,8 +36,10 @@ identities, products, campaigns, and file counts all come from the mounted data.
 ## Build and run
 
 Use Linux or WSL with Docker. The launcher selects the executable from the
-running CPU's capabilities. The C++ build uses profile-guided optimization
-on build hosts that support x86-64-v3.
+running CPU's capabilities. A v4 build host trains both native binaries.
+A v3 host trains the v3 binary and uses compatible profiles when compiling
+the v4 binary. Older build hosts cross-compile both. Only the v4 binary uses
+the 64-byte scanner for row delimiters and field masks.
 
 ```sh
 make build
