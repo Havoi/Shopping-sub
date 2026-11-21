@@ -127,27 +127,6 @@ Under Intel SDE, the packaged image selected that executable, passed the
 36 fixtures and reproduced the 1M answer. Native AVX-512 performance remains
 unmeasured. [AVX-512 comparison branch](https://github.com/Havoi/Shopping-sub/tree/perf/avx512)
 
-## Public implementations compared
-
-The November 21 public practice board showed team 67 at 0.36 s, Fraun at
-0.64 s and VibDiv at 0.76 s. The board publishes team names and scores.
-We could verify repository matches for Fraun and VibDiv. The source behind
-the 0.36 s entry remains unconfirmed. [Track and standings](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions)
-
-* Fraun routes raw user IDs to keep identity lookups close together in memory.
-  We tested resolving identities during parsing and routing straight to the
-  final worker. Waiting for all links first slowed our pipeline on the 20M
-  input. [Fraun's strategy](https://github.com/Jerryh127/fraun-shopping-sessions/blob/7044ee91c989222b2003204501a2e98d9b49a02d/STRATEGY.md)
-* VibDiv measured the effect of buffering records until they fill a cache
-  line. We independently implemented this and compared it with contiguous
-  per-chunk storage. We also rebuilt their scored commit, `8527c64`. It took
-  a median 1.210 s on our machine. Our submitted `b45f23d` took 1.358 s
-  in the same trial. All 2,224,281 user/day rows and 28,014 campaign/day rows
-  agreed after widening two integer columns. [VibDiv's benchmarks](https://github.com/Vibhor7-7/shopping-sessions/blob/738e1a02f65cb66bf8d0cc365a2a172d229dc47e/BENCH.md) · [Scored commits](https://github.com/Vibhor7-7/shopping-sessions/blob/738e1a02f65cb66bf8d0cc365a2a172d229dc47e/SUBMISSIONS.md)
-* Other public implementations use direct attribution for people with very
-  few clicks, map each click to a contiguous range of sessions, or start
-  the largest person buckets first. We tested all three ideas. [Small click lists](https://github.com/Js-Hwang1/buildathon_databricks/blob/fc2965e0563653dee747beac45f65eca6b336b19/src/engine.cpp) · [Session ranges](https://github.com/matthewf725/shopping-sessions/blob/ef41f89be7e70a37fa26801b45bb36517ced994c/src/sessions.hpp) · [Bucket scheduling](https://github.com/zlyuan9/shopping-sessions/blob/cf574646a148bfa8d894fa8ae0f2aae1fefe7018/src/main.rs)
-
 ## Local measurements for the 1.17 s submission
 
 The team reports **1.52 s on the portal** for commit `36e2f49` and 8 s
