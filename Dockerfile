@@ -1,32 +1,22 @@
-FROM rust:1.85-bookworm AS build
+FROM rust:1.85-bookworm AS portable
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
-# Select for the runner's CPU. The build host can be a different model.
-RUN cc -O2 -Wall -Wextra -Werror src/launch.c -o /build/launcher \
-    && RUSTFLAGS='-C target-cpu=x86-64-v3 -C target-feature=+aes' cargo build --release --locked \
-    && cp target/release/shopping-sessions /build/tuned \
-    && cargo build --release --locked --offline
+RUN cargo build --release --locked && cc -O2 -Wall -Wextra -Werror src/launch.c -o launcher
 
-# Rust 1.100 builds AVX-512 intrinsics; host-side build scripts retain
-# the builder's native instruction set. Both compilers share locked crates.
-FROM rust:1.100-bookworm AS build-v4
-WORKDIR /build
-COPY --from=build /usr/local/cargo/registry /usr/local/cargo/registry
-COPY Cargo.toml Cargo.lock ./
-COPY src/ src/
-RUN RUSTFLAGS='-C target-cpu=x86-64-v4 -C target-feature=+aes' \
-    cargo build --release --locked --offline --target x86_64-unknown-linux-gnu
+FROM docker.io/library/gcc:15-bookworm@sha256:9ca91b05c7b07d2979f16413e8b2cd6ec8a7c80ffca4121ccab0aeba33f90460 AS native
+RUN apt-get update && apt-get install -y --no-install-recommends python3 liblz4-dev && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY native/*.cpp native/*.hpp native/build.sh native/training.py ./
+RUN sh build.sh /usr/local/bin/shopping-sessions && strip /usr/local/bin/shopping-sessions
 
 FROM debian:bookworm-slim
-RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
-COPY --from=build /build/launcher /usr/local/bin/shopping-sessions
-COPY --from=build /build/tuned /usr/local/libexec/shopping-tuned
-COPY --from=build-v4 /build/target/x86_64-unknown-linux-gnu/release/shopping-sessions /usr/local/libexec/shopping-v4
-COPY --from=build /build/target/release/shopping-sessions /usr/local/libexec/shopping-generic
-# Ask glibc to use transparent huge pages for eligible heap allocations.
-# The kernel chooses the backing page size, including on hosts without THP.
-ENV GLIBC_TUNABLES=glibc.malloc.hugetlb=1
-ENV DATA_DIR=/data OUTPUT_DIR=/output SCRATCH_DIR=/scratch HOME=/scratch TMPDIR=/scratch
+RUN apt-get update && apt-get install -y --no-install-recommends libjemalloc2 liblz4-1 && rm -rf /var/lib/apt/lists/*
+COPY --from=portable /build/launcher /usr/local/bin/shopping-sessions
+COPY --from=portable /build/target/release/shopping-sessions /usr/local/libexec/shopping-generic
+COPY --from=native /usr/local/bin/shopping-sessions /usr/local/libexec/shopping-native
+COPY native/LICENSE /usr/share/doc/shopping-sessions/native-LICENSE
+ENV MALLOC_CONF=thp:always,narenas:1
+ENV DATA_DIR=/data OUTPUT_DIR=/output SCRATCH_DIR=/scratch HOME=/scratch TMPDIR=/scratch NCPU=8
 USER 1000:1000
-CMD ["/usr/local/bin/shopping-sessions"]
+ENTRYPOINT ["/usr/local/bin/shopping-sessions"]

@@ -1,9 +1,16 @@
 # Shopping Sessions
 
-A Rust implementation of the Shopping Sessions challenge. It reads the mounted
-CSV inputs, resolves linked IDs, and writes both required Parquet tables.
+This branch runs a C++20 Shopping Sessions pipeline on x86-64-v3 hardware
+and the team's Rust implementation on older amd64 machines. It reads the
+mounted CSV inputs, resolves linked IDs, and writes both required Parquet tables.
 The exact behavior is specified in [rules.md](rules.md). Current verification
 results and remaining work are recorded in [PROGRESS.txt](PROGRESS.txt).
+
+The native pipeline is derived from [Shopping Sessions contributors' public
+C++ solver](https://github.com/mliao0128/fraun-shopping-sessions/tree/dd510eadd036edcc10af568ad6dd3d656ae98f73)
+at revision `dd510eadd036edcc10af568ad6dd3d656ae98f73`. Its copyright
+and MIT permission notice are retained in [native/LICENSE](native/LICENSE)
+and in the runtime image. The C++ build uses GCC, jemalloc and LZ4.
 
 The image starts a compiled executable with no arguments. Dependencies are
 installed during the build. Runtime diagnostics go to stderr. Input dates,
@@ -11,9 +18,9 @@ identities, products, campaigns, and file counts all come from the mounted data.
 
 ## Build and run
 
-Use Linux or WSL with Docker. At startup the linux/amd64 image selects the
-x86-64-v4 executable on CPUs with AVX-512 and AES, the x86-64-v3 executable
-on CPUs with v3 and AES, or the generic amd64 executable.
+Use Linux or WSL with Docker. The launcher selects the executable from the
+running CPU's capabilities. The C++ build uses profile-guided optimization
+on build hosts that support x86-64-v3.
 
 ```sh
 make build
@@ -66,10 +73,15 @@ make run DATA=/path/to/seed42 OUT=/path/to/output42
 python3 scripts/compare.py /path/to/output42 /path/to/expected42
 ```
 
-CSV, timestamp, identity and compact-record unit checks are available with `make test` when Rust 1.85 or later is
-installed. `Cargo.lock` pins the dependency graph used by the Docker build.
+Run `make test-native` with a C++20 compiler on an x86-64-v3 Linux machine
+for the native unit checks. `make test` runs the Rust checks with Rust 1.85
+or later. `Cargo.lock` pins the Rust dependency graph used by the Docker build.
 
-## Event parsing and identity links
+## Rust implementation and previous submissions
+
+The following implementation notes and timings describe the Rust solver.
+
+### Event parsing and identity links
 
 The event reader validates quotes and field boundaries while extracting the
 fields needed for common view and cart rows. It decodes event and arrival

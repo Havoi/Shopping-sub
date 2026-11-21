@@ -7,7 +7,7 @@ OUT ?= out
 ANSWER ?= dev-answer
 export IMAGE CPUS MEM PLATFORM
 
-.PHONY: build fixtures dev run check-dev check-totals test
+.PHONY: build fixtures dev run check-dev check-totals test test-native
 
 build:
 	docker build --platform $(PLATFORM) -t $(IMAGE) .
@@ -29,3 +29,6 @@ check-totals:
 
 test:
 	cargo test --release --locked
+
+test-native:
+	sh scripts/test_native.sh

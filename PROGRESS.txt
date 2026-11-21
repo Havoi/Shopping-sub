@@ -2,6 +2,10 @@ Shopping Sessions progress checklist
 Updated 2026-11-21, Asia/Kolkata
 
 Submission and targets
+[x] Start the attributed C++ branch from public revision dd510ea. Verify
+    both output tables on 49 reference datasets and two further edge cases.
+[ ] Compare candidate builds on 20M and 60M events and publish the measured
+    revision. The sub-0.500 s target will require a portal result.
 [x] Implement the rules and publish the original solution, d6783e0.
     The team reported 8 seconds and rank 178.
 [x] Publish 36e2f49. The team reported 1.52 seconds on the practice portal.
