@@ -46,6 +46,17 @@ Submission and targets
     implementation ran.
 [x] Reserve seed 38721619 for the next 20M comparison before timing
     changes to the 0.630 s solver.
+[x] Compare alternate event-ID indexing, shopper grouping, row parsing,
+    partition sizes, memory reuse, a Clang PGO build and short-session
+    sorting against d23a4e4. The AVX2 sort for 4 to 32 event times reduced
+    the two initial 20M medians from 0.859 to 0.792 s and 0.921 to 0.851 s.
+[x] Repeat the session-sort comparison on the reserved 20M seed, ten runs
+    per image. d23a4e4 took 0.848 s and the candidate took 0.952 s.
+[x] On seed 271828 the 20M medians were 0.843 s for d23a4e4 and 0.856 s
+    for the candidate (ten runs each). At 60M, seed 99, the medians were
+    4.335 s and 4.557 s (five runs each). Both output tables matched on
+    all 51 reference cases and on every key and column of the timed inputs.
+    Keep d23a4e4 as the recommended scoring commit.
 [ ] Reach a portal time below 0.300 s. From 0.630 s this requires saving
     more than 330 ms, or improving throughput by more than 2.10 times.
 [x] Implement the rules and publish the original solution, d6783e0.
