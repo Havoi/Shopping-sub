@@ -20,12 +20,13 @@ Updated 2026-11-21, Asia/Kolkata
 [x] Check image and submission source sizes.
 [x] Initialize the local Git repository with generated data excluded.
 [x] Finish the verification summary and record remaining limitations.
-[ ] Publish the verified solution to Havoi/Shopping-sub.
+[x] Publish the verified solution to Havoi/Shopping-sub.
 [ ] Submit a commit to the competition scorer.
 
 Current status
-Local implementation and verification are complete. Publication to the public
-Havoi/Shopping-sub repository is in progress. Competition scoring is pending.
+Local implementation and verification are complete. The solution is published
+on the main branch of https://github.com/Havoi/Shopping-sub.
+Competition submission and scoring are pending.
 
 Final-image benchmarks
 20M events and 5M clicks, seed 2026
