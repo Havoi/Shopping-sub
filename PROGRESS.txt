@@ -14,6 +14,32 @@ Submission and targets
     The 1.08 s submission had local warm medians of 1.471, 1.514 and 1.440 s.
 [ ] Beat 0.500 s on the next portal submission. Longer-term target: 0.300 s.
 
+Submission candidate with fused event parsing and a smaller identity table
+[x] Store one decreasing edge for each redirected key, resolve conflicting
+    parents, and publish exact canonical names before session aggregation.
+[x] Parse common view/cart rows directly and decode paired UTC timestamps.
+    CPU dispatch selects generic amd64, x86-64-v3 or x86-64-v4 with AVX-512.
+[x] Build the final 30,199,553-byte image in 183 seconds and pass all 16 unit
+    tests with both the tuned and generic CPU configurations.
+[x] Time the packaged image against the submitted b86512b with eight pinned
+    threads and 6 GiB. Each practice image ran four times after warmup. The
+    previously unused seed 91827361 was reserved before candidate selection.
+    Input                    b86512b median      New median
+    20M, seed 91827361              1.440 s         1.293 s
+    20M, seed 271828                1.396 s         1.361 s
+    20M, seed 73                    1.317 s         1.343 s
+    60M, seed 99 (3 runs)           5.953 s         6.332 s
+    Individual final-scale times were 20.488, 5.953, 5.797 s for b86512b
+    and 6.583, 6.109, 6.332 s for the new build. Native timings used v3.
+[x] Verify the packaged launcher on 36 official fixtures and 13 reference
+    inputs. The generic executable matched the dev answer. All 36 fixtures
+    and the dev answer matched under emulated AVX-512, and dispatch to the
+    v3 and generic executables was verified on two additional CPU profiles.
+[x] Compare both full output tables on all four timed inputs. The new seed
+    had 2,229,959 user/day rows and 28,014 campaign/day rows. The 60M input
+    had 6,648,247 and 28,014 rows. All columns and grouping keys matched.
+[x] Publish this implementation on main. The portal score is pending.
+
 Critical-path measurements from b86512b
 [x] Time two 20M inputs with 5M clicks, four interleaved warm containers
     per input. The current solver reached the end of event routing and click

@@ -11,8 +11,9 @@ identities, products, campaigns, and file counts all come from the mounted data.
 
 ## Build and run
 
-Use Linux or WSL with Docker. The linux/amd64 image selects its CPU target at
-startup. It includes a build for x86-64-v3 with AES and a generic amd64 build.
+Use Linux or WSL with Docker. At startup the linux/amd64 image selects the
+x86-64-v4 executable on CPUs with AVX-512 and AES, the x86-64-v3 executable
+on CPUs with v3 and AES, or the generic amd64 executable.
 
 ```sh
 make build
@@ -68,6 +69,17 @@ python3 scripts/compare.py /path/to/output42 /path/to/expected42
 CSV, timestamp, identity and compact-record unit checks are available with `make test` when Rust 1.85 or later is
 installed. `Cargo.lock` pins the dependency graph used by the Docker build.
 
+## Event parsing and identity links
+
+The event reader validates quotes and field boundaries while extracting the
+fields needed for common view and cart rows. It decodes event and arrival
+clocks together when they share a UTC date. Other layouts use the complete
+field parser. Invalid events still participate in earliest-arrival selection.
+
+The identity table initially points each larger ID at one smaller neighbor.
+When two links give it different parents, the solver joins their components.
+It then stores each ID's final canonical name for event and click lookups.
+
 ## Worker memory reuse
 
 The team scored **1.05 s** with commit `b86512b`.
@@ -113,10 +125,8 @@ tables matched on all three practice inputs and the final-size input,
 including all 6,648,247 user/day rows at final size. The container passed
 all 36 public fixtures, and both CPU builds matched the public 1M answer.
 
-The optional AVX-512 branch adds a third executable selected by the launcher.
-Under Intel SDE, the packaged image selected that executable, passed the
-36 fixtures and reproduced the 1M answer. Native AVX-512 performance remains
-unmeasured. [AVX-512 comparison branch](https://github.com/Havoi/Shopping-sub/tree/perf/avx512)
+The earlier AVX-512 comparison branch first verified CPU dispatch and the
+64-byte CSV classifier under Intel SDE. The current image includes this path.
 
 ## Local measurements for the 1.17 s submission
 

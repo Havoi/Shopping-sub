@@ -261,6 +261,11 @@ fn save_payload(parts: &mut PersonChunk, event: PersonEvent, context: &Context) 
     u32::try_from(index | group).expect("too many records in a chunk")
 }
 
+enum EventId<'a> {
+    Compact(u64),
+    Other(&'a [u8]),
+}
+
 pub(crate) fn scan_events<'a>(input: &'a Inputs, context: &Context) -> EventParts<'a> {
     let chunks = input.chunks();
     let prefix = chunks
@@ -288,68 +293,109 @@ pub(crate) fn scan_events<'a>(input: &'a Inputs, context: &Context) -> EventPart
                 wide: buckets(group_count),
             };
             let mut dates = TimestampParser::new();
-            for [id, user, ts, ingest, kind, product, price] in rows::<7>(chunk) {
-                if id.is_empty() {
-                    continue;
-                }
-                let seconds = dates.ingest_seconds(ingest);
+            crate::parse::visit_event_rows(chunk, prefix, |row| {
+                let (id, seconds, location) = match row {
+                    crate::parse::EventInput::Activity {
+                        suffix,
+                        person,
+                        timestamp,
+                        arrival,
+                    } => {
+                        let (seconds, timestamp) = dates.event_arrival(timestamp, arrival);
+                        let location = timestamp
+                            .filter(|&ts| {
+                                ts >= context.start
+                                    && ts < context.end
+                                    && seconds * 1000 - ts <= DAY
+                            })
+                            .map_or(ABSENT, |ts| {
+                                save_payload(
+                                    &mut people,
+                                    PersonEvent {
+                                        person,
+                                        ts,
+                                        revenue: 0,
+                                        category: context.dimensions.unknown,
+                                    },
+                                    context,
+                                )
+                            });
+                        let mixed = crate::mix_key(suffix);
+                        (EventId::Compact(mixed ^ (mixed >> 32)), seconds, location)
+                    }
+                    crate::parse::EventInput::General(
+                        [id, user, ts, ingest, kind, product, price],
+                    ) => {
+                        if id.is_empty() {
+                            return;
+                        }
+                        let seconds = dates.ingest_seconds(ingest);
+                        let ingest = seconds * 1000;
+                        let revenue = if kind == b"purchase" {
+                            unsigned(price)
+                                .filter(|value| (1..=10_000_000).contains(value))
+                                .unwrap_or(0) as u32
+                        } else {
+                            0
+                        };
+                        let valid = !user.is_empty()
+                            && !product.is_empty()
+                            && (revenue > 0 || kind == b"view" || kind == b"cart");
+                        let location = if let Some(ts) = dates.timestamp(ts).filter(|&ts| {
+                            valid && ts >= context.start && ts < context.end && ingest - ts <= DAY
+                        }) {
+                            let category = if revenue == 0 {
+                                context.dimensions.unknown
+                            } else {
+                                context.dimensions.category_for(product)
+                            };
+                            save_payload(
+                                &mut people,
+                                PersonEvent {
+                                    person: context.people.key(user),
+                                    ts,
+                                    revenue,
+                                    category,
+                                },
+                                context,
+                            )
+                        } else {
+                            ABSENT
+                        };
+                        let id =
+                            compact_key(id, prefix).map_or(EventId::Other(id), EventId::Compact);
+                        (id, seconds, location)
+                    }
+                };
                 let ingest = seconds * 1000;
-                let revenue = if kind == b"purchase" {
-                    unsigned(price)
-                        .filter(|value| (1..=10_000_000).contains(value))
-                        .unwrap_or(0) as u32
-                } else {
-                    0
-                };
-                let valid = !user.is_empty()
-                    && !product.is_empty()
-                    && (revenue > 0 || kind == b"view" || kind == b"cart");
-                let location = if let Some(ts) = dates.timestamp(ts).filter(|&ts| {
-                    valid && ts >= context.start && ts < context.end && ingest - ts <= DAY
-                }) {
-                    let category = if revenue == 0 {
-                        context.dimensions.unknown
-                    } else {
-                        context.dimensions.category_for(product)
-                    };
-                    save_payload(
-                        &mut people,
-                        PersonEvent {
-                            person: context.people.key(user),
-                            ts,
-                            revenue,
-                            category,
-                        },
-                        context,
-                    )
-                } else {
-                    ABSENT
-                };
                 let mask = context.event_shards - 1;
-                if let Some(key) = compact_key(id, prefix) {
-                    let shard = key as usize & mask;
-                    let seconds = seconds as u64;
-                    let ingest = if seconds < u64::from(EXTENDED_INGEST) {
-                        seconds as u32
-                    } else {
-                        ids.details[shard]
-                            .extended
-                            .insert(ids.rows.counts[shard], ingest);
-                        EXTENDED_INGEST
-                    };
-                    ids.rows.push(
-                        shard,
-                        Entry {
-                            key,
-                            location,
-                            ingest,
-                        },
-                    );
-                } else {
-                    let shard = context.hash.hash_one(id) as usize & mask;
-                    ids.details[shard].general.push((id, ingest, location));
+                match id {
+                    EventId::Compact(key) => {
+                        let shard = key as usize & mask;
+                        let seconds = seconds as u64;
+                        let ingest = if seconds < u64::from(EXTENDED_INGEST) {
+                            seconds as u32
+                        } else {
+                            ids.details[shard]
+                                .extended
+                                .insert(ids.rows.counts[shard], ingest);
+                            EXTENDED_INGEST
+                        };
+                        ids.rows.push(
+                            shard,
+                            Entry {
+                                key,
+                                location,
+                                ingest,
+                            },
+                        );
+                    }
+                    EventId::Other(id) => {
+                        let shard = context.hash.hash_one(id) as usize & mask;
+                        ids.details[shard].general.push((id, ingest, location));
+                    }
                 }
-            }
+            });
             (ids, people)
         })
         .collect();

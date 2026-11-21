@@ -173,46 +173,22 @@ impl AliasTable {
         }
     }
 
-    fn vertex(&mut self, key: u64) -> usize {
-        let index = self.position(key);
-        let slot = &mut self.slots[index];
-        if slot.key == VACANT {
-            *slot = Slot {
-                key,
-                value: index as u64,
-            };
-        }
-        index
-    }
-
-    fn root(&mut self, mut index: usize) -> usize {
+    fn compress(&mut self, key: u64) -> u64 {
+        let mut root = key;
         loop {
-            let parent = self.slots[index].value as usize;
-            if index == parent {
-                return index;
+            let next = self.get(root);
+            if next == root {
+                break;
             }
-            let grandparent = self.slots[parent].value as usize;
-            self.slots[index].value = grandparent as u64;
-            if grandparent == parent {
-                return parent;
-            }
-            index = grandparent;
+            root = next;
         }
-    }
-
-    #[inline]
-    fn prefetch(&self, key: u64) {
-        #[cfg(target_arch = "x86_64")]
-        {
-            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-            let slot = &self.slots[self.bucket(key)];
-            // The slot is inside this live table. The instruction is a cache hint.
-            unsafe {
-                _mm_prefetch((slot as *const Slot).cast(), _MM_HINT_T0);
-            }
+        let mut k = key;
+        while k != root {
+            let i = self.position(k);
+            k = self.slots[i].value;
+            self.slots[i].value = root;
         }
-        #[cfg(not(target_arch = "x86_64"))]
-        let _ = key;
+        root
     }
 }
 
@@ -230,22 +206,41 @@ impl People {
     }
 
     pub fn load_links(&self, links: &Inputs) {
-        let edges: Vec<Vec<(u64, u64)>> = links
-            .chunks_with_size(128 * 1024)
+        // Each edge points from the greater spelling to the smaller one. Picking
+        // one outgoing edge for each key immediately creates a decreasing forest.
+        // Only keys with another distinct parent require a full union operation.
+        let groups = if links.bytes() >= 1024 * 1024 {
+            32usize
+        } else {
+            1
+        };
+        let shift = 64 - groups.trailing_zeros();
+        let edges: Vec<_> = links
+            .chunks_with_size(256 * 1024)
             .into_par_iter()
             .map(|chunk| {
-                rows::<2>(chunk)
-                    .filter(|[a, b]| !a.is_empty() && !b.is_empty() && a != b)
-                    .map(|[a, b]| (self.key(a), self.key(b)))
-                    .collect()
+                let mut buckets = (0..groups).map(|_| Vec::new()).collect::<Vec<_>>();
+                for [a, b] in rows::<2>(chunk) {
+                    if a.is_empty() || b.is_empty() || a == b {
+                        continue;
+                    }
+                    let (hi, lo) = if a > b { (a, b) } else { (b, a) };
+                    let hi = self.key(hi);
+                    let group = if groups == 1 {
+                        0
+                    } else {
+                        (crate::mix_key(hi) >> shift) as usize
+                    };
+                    buckets[group].push((hi, self.key(lo)));
+                }
+                buckets
             })
             .collect();
-        let count: usize = edges.iter().map(Vec::len).sum();
-        // There are at most two new keys per edge. The table never grows
-        // while parent links refer to its slot indices.
-        let capacity = (count * 2 + count / 2 + 8).next_power_of_two();
+        let count: usize = edges.iter().flatten().map(Vec::len).sum();
+        let capacity = (count + count / 2 + 8).max(groups * 16).next_power_of_two();
+        let shift = 64 - capacity.trailing_zeros();
+        let width = capacity / groups;
         let mut aliases = AliasTable {
-            redirected: vec![0; (capacity / 16).max(1)],
             slots: vec![
                 Slot {
                     key: VACANT,
@@ -253,51 +248,108 @@ impl People {
                 };
                 capacity
             ],
-            shift: 64 - capacity.trailing_zeros(),
+            redirected: vec![0; capacity / 16],
+            shift,
             len: 0,
         };
-        for chunk in edges {
-            for (index, &(a, b)) in chunk.iter().enumerate() {
-                if let Some(&(c, d)) = chunk.get(index + 24) {
-                    aliases.prefetch(c);
-                    aliases.prefetch(d);
+        let rest: Vec<_> = aliases
+            .slots
+            .par_chunks_mut(width)
+            .zip(aliases.redirected.par_chunks_mut(width / 16))
+            .enumerate()
+            .map(|(group, (slots, bits))| {
+                let mut overflow = Vec::new();
+                let mut conflicts = Vec::new();
+                let mut used = 0;
+                for chunk in &edges {
+                    for &(hi, lo) in &chunk[group] {
+                        let h = crate::mix_key(hi);
+                        let local = ((h >> shift) as usize) & (width - 1);
+                        let bit = ((h >> (shift - 2)) as usize) & (4 * width - 1);
+                        bits[bit >> 6] |= 1u64 << (bit & 63);
+                        // Spill at the boundary so the completed table supports
+                        // ordinary global linear probing for every later lookup.
+                        match slots[local..]
+                            .iter_mut()
+                            .find(|s| s.key == VACANT || s.key == hi)
+                        {
+                            Some(s) if s.key == VACANT => {
+                                *s = Slot { key: hi, value: lo };
+                                used += 1;
+                            }
+                            Some(s) if s.value != lo => conflicts.push((s.value, lo)),
+                            Some(_) => {}
+                            None => overflow.push((hi, lo)),
+                        }
+                    }
                 }
-                let l = aliases.vertex(a);
-                let r = aliases.vertex(b);
-                let left = aliases.root(l);
-                let right = aliases.root(r);
-                if left == right {
-                    continue;
+                (used, overflow, conflicts)
+            })
+            .collect();
+        drop(edges);
+        let mut conflicts = Vec::new();
+        for (used, spill, mut more) in rest {
+            aliases.len += used;
+            conflicts.append(&mut more);
+            for (hi, lo) in spill {
+                let pos = aliases.position(hi);
+                let s = &mut aliases.slots[pos];
+                if s.key == VACANT {
+                    *s = Slot { key: hi, value: lo };
+                    aliases.len += 1;
+                } else if s.value != lo {
+                    conflicts.push((s.value, lo));
                 }
-                let lk = aliases.slots[left].key;
-                let rk = aliases.slots[right].key;
-                let less = if (lk & GENERIC == 0 && rk & GENERIC == 0)
-                    || (lk & INTERNED == GENERIC && rk & INTERNED == GENERIC)
-                {
-                    lk.swap_bytes() < rk.swap_bytes()
+            }
+        }
+        for (a, b) in conflicts {
+            let left = aliases.compress(a);
+            let right = aliases.compress(b);
+            if left == right {
+                continue;
+            }
+            let less = if (left & GENERIC == 0 && right & GENERIC == 0)
+                || (left & INTERNED == GENERIC && right & INTERNED == GENERIC)
+            {
+                left.swap_bytes() < right.swap_bytes()
+            } else {
+                self.name(left) < self.name(right)
+            };
+            let (hi, lo) = if less { (right, left) } else { (left, right) };
+            let at = aliases.position(hi);
+            aliases.slots[at] = Slot { key: hi, value: lo };
+            let bit = aliases.redirect_bit(hi);
+            aliases.redirected[bit >> 6] |= 1u64 << (bit & 63);
+            aliases.len += 1;
+        }
+        // Freeze short chains independently. Compressing the exceptional long
+        // chains below bounds the cost of inputs arranged as a single long path.
+        let roots: Vec<_> = aliases
+            .slots
+            .par_iter()
+            .map(|slot| {
+                if slot.key == VACANT {
+                    return VACANT;
+                }
+                let mut key = slot.value;
+                for _ in 0..5 {
+                    let next = aliases.get(key);
+                    if next == key {
+                        return key;
+                    }
+                    key = next;
+                }
+                VACANT
+            })
+            .collect();
+        for (i, root) in roots.into_iter().enumerate() {
+            if aliases.slots[i].key != VACANT {
+                let next = if root == VACANT {
+                    aliases.compress(aliases.slots[i].value)
                 } else {
-                    self.name(lk) < self.name(rk)
+                    root
                 };
-                let (small, large) = if less { (left, right) } else { (right, left) };
-                aliases.slots[large].value = small as u64;
-                aliases.len += 1;
-            }
-        }
-        for i in 0..capacity {
-            if aliases.slots[i].key != VACANT {
-                aliases.slots[i].value = aliases.root(i) as u64;
-            }
-        }
-        for i in 0..capacity {
-            if aliases.slots[i].key != VACANT {
-                let root = aliases.slots[i].value as usize;
-                let key = aliases.slots[i].key;
-                let canonical = aliases.slots[root].key;
-                aliases.slots[i].value = canonical;
-                if key != canonical {
-                    let tag = aliases.redirect_bit(key);
-                    aliases.redirected[tag >> 6] |= 1u64 << (tag & 63);
-                }
+                aliases.slots[i].value = next;
             }
         }
         assert!(self.aliases.set(aliases).is_ok(), "links already loaded");
@@ -472,6 +524,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn decreasing_forest_handles_conflicting_parents_and_cluster_wraparound() {
+        let people = People::new();
+        let keys: Vec<_> = (0..200_000u32)
+            .map(|n| format!("u{n:08x}"))
+            .filter(|name| crate::mix_key(people.key(name.as_bytes())) >> 55 == 511)
+            .take(10)
+            .collect();
+        assert_eq!(keys.len(), 10);
+
+        let mut csv = b"user_id_a,user_id_b\n".to_vec();
+        for key in &keys {
+            csv.extend_from_slice(format!("{key},a\n").as_bytes());
+        }
+        csv.extend_from_slice(b"z,q\nz,r\nr,b\nq,z\nextra-long-identity,z\n");
+        for n in 0..32 {
+            csv.extend_from_slice(format!("n{n:02},n{:02}\n", n + 1).as_bytes());
+        }
+        // One malformed line selects the multi-partition path without changing
+        // the graph or its 512-slot capacity.
+        csv.resize(csv.len() + 1024 * 1024, b'x');
+        let mut map = memmap2::MmapMut::map_anon(csv.len()).unwrap();
+        map.copy_from_slice(&csv);
+        people.load_links(&Inputs {
+            maps: vec![map.make_read_only().unwrap()],
+        });
+        for key in keys {
+            assert_eq!(people.name(people.resolve(key.as_bytes())), b"a");
+        }
+        for name in [b"z".as_slice(), b"r", b"q", b"extra-long-identity"] {
+            assert_eq!(people.name(people.resolve(name)), b"b");
+        }
+        assert_eq!(people.name(people.resolve(b"n32")), b"n00");
+        assert_eq!(people.name(people.resolve(b"unlinked")), b"unlinked");
+    }
+
+    #[test]
     fn redirect_fingerprint_collision_still_checks_the_key() {
         let mut aliases = AliasTable {
             slots: vec![
@@ -487,7 +575,8 @@ mod tests {
         };
         let raw = 9;
         let canonical = 3;
-        let index = aliases.vertex(raw);
+        let index = aliases.position(raw);
+        aliases.slots[index].key = raw;
         aliases.slots[index].value = canonical;
         let bit = aliases.redirect_bit(raw);
         aliases.redirected[0] |= 1 << bit;
