@@ -41,8 +41,11 @@ Submission and targets
     inputs. Both tables matched the scored build for every key and column,
     including 2,250,376 and 6,648,247 user/day rows. The image is 30,358,105
     bytes. Its local build took 191 seconds with cached base layers.
-[ ] Measure this AVX-512 build on the portal. Local hardware runs the AVX2
-    binary. Whole-container AVX-512 performance is unmeasured.
+[x] The team reported 0.660 s for ed6b46b on the portal. The best confirmed
+    commit is d23a4e4 at 0.630 s. The portal does not identify which CPU
+    implementation ran.
+[x] Reserve seed 38721619 for the next 20M comparison before timing
+    changes to the 0.630 s solver.
 [ ] Reach a portal time below 0.300 s. From 0.630 s this requires saving
     more than 330 ms, or improving throughput by more than 2.10 times.
 [x] Implement the rules and publish the original solution, d6783e0.
