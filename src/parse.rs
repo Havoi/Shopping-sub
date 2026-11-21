@@ -61,23 +61,36 @@ struct Structural {
 ))]
 #[inline]
 fn classify(block: &[u8; 64]) -> Structural {
+    let a = classify32(block.first_chunk().unwrap());
+    let b = classify32(block[32..].first_chunk().unwrap());
+    Structural {
+        newlines: a.newlines | (b.newlines << 32),
+        separators: a.separators | (b.separators << 32),
+        quotes: a.quotes | (b.quotes << 32),
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "bmi2"
+))]
+#[inline]
+fn classify32(block: &[u8; 32]) -> Structural {
     use std::arch::x86_64::*;
-    let mut masks = Structural::default();
-    // Both unaligned 32-byte loads are within the array, and the build target
-    // provides AVX2. No lookahead load is taken from outside the mapped file.
+    // The 32-byte load is within the block and AVX2 is enabled.
     unsafe {
-        for offset in [0, 32] {
-            let input = _mm256_loadu_si256(block.as_ptr().add(offset).cast());
-            let matches = |byte| {
-                _mm256_movemask_epi8(_mm256_cmpeq_epi8(input, _mm256_set1_epi8(byte))) as u32 as u64
-            };
-            masks.newlines |= matches(b'\n' as i8) << offset;
-            masks.separators |= matches(b',' as i8) << offset;
-            masks.quotes |= matches(b'"' as i8) << offset;
+        let input = _mm256_loadu_si256(block.as_ptr().cast());
+        let matches = |byte| {
+            _mm256_movemask_epi8(_mm256_cmpeq_epi8(input, _mm256_set1_epi8(byte))) as u32 as u64
+        };
+        let newlines = matches(b'\n' as i8);
+        Structural {
+            newlines,
+            separators: newlines | matches(b',' as i8),
+            quotes: matches(b'"' as i8),
         }
     }
-    masks.separators |= masks.newlines;
-    masks
 }
 
 /// Iterate over well-formed rows, preserving byte-exact field values.
@@ -124,14 +137,45 @@ fn fast_record<const N: usize>(line: &[u8], sep: u128, quotes: u128) -> Option<[
         if quotes & !(openings ^ closings) != 0 {
             return None;
         }
-        // Extract at separators to align opening and closing bits by field index.
-        let open = (quotes as u64 & 1) | (extract(quotes >> 1, sep) << 1);
-        let close = extract(quotes << 1, sep);
-        if open != close {
+        // A carry from an opening quote runs through the field and stops at
+        // its separator. The marked separators must match the closing quotes.
+        let opened_ends = (!sep).wrapping_add(quotes & openings) & sep;
+        if opened_ends != (quotes & closings) << 1 {
             return None;
         }
-        open
+        extract(opened_ends, sep)
     };
+    if N == 7 {
+        let low = sep as u64;
+        let after_one = low & low.wrapping_sub(1);
+        let after_two = after_one & after_one.wrapping_sub(1);
+        let after_three = after_two & after_two.wrapping_sub(1);
+        let high = (sep >> 64) as u64;
+        if after_two != 0 && ((high >> 48) | (after_three & ((1 << 48) - 1))) == 0 {
+            // The first three separators fit the first word; the final four
+            // fit the overlapping 64-byte word beginning at byte 48.
+            let mut suffix = (after_three >> 48) | (high << 16);
+            let mut previous = 0;
+            return Some(std::array::from_fn(|index| {
+                let end = match index {
+                    0 => low.trailing_zeros() as usize,
+                    1 => after_one.trailing_zeros() as usize,
+                    2 => after_two.trailing_zeros() as usize,
+                    _ => {
+                        let pos = 48 + suffix.trailing_zeros() as usize;
+                        suffix &= suffix - 1;
+                        pos
+                    }
+                };
+                let trim = ((open_flags >> index) & 1) as usize;
+                // All offsets came from separators inside this row. Quoted
+                // fields passed the paired and exclusive boundary checks.
+                let slice = unsafe { line.get_unchecked(previous + trim..end - trim) };
+                previous = end + 1;
+                slice
+            }));
+        }
+    }
     let mut sep_lo = sep as u64;
     let mut sep_hi = (sep >> 64) as u64;
     let mut previous = 0;
@@ -147,7 +191,8 @@ fn fast_record<const N: usize>(line: &[u8], sep: u128, quotes: u128) -> Option<[
             end
         };
         let trim = (open_flags >> index) as usize & 1;
-        *field = &line[previous + trim..end - trim];
+        // Each separator is in the row and a trimmed field has two distinct quotes.
+        *field = unsafe { line.get_unchecked(previous + trim..end - trim) };
         previous = end + 1;
     }
     Some(result)
@@ -167,7 +212,13 @@ impl<'a, const N: usize> Iterator for FastRows<'a, N> {
             if N < 32 && data.len() >= 128 {
                 let a = classify(data[..64].try_into().unwrap());
                 let (sep, quotes, len) = if a.newlines == 0 {
-                    let b = classify(data[64..128].try_into().unwrap());
+                    let mut b = classify32(data[64..96].try_into().unwrap());
+                    if b.newlines == 0 {
+                        let last = classify32(data[96..128].try_into().unwrap());
+                        b.newlines |= last.newlines << 32;
+                        b.quotes |= last.quotes << 32;
+                        b.separators |= last.separators << 32;
+                    }
                     (
                         (a.separators as u128) | ((b.separators as u128) << 64),
                         (a.quotes as u128) | ((b.quotes as u128) << 64),
@@ -201,7 +252,29 @@ impl<'a, const N: usize> Iterator for FastRows<'a, N> {
         None
     }
 }
+#[inline]
+fn eight_digits(digits: u64) -> i64 {
+    let pairs = (digits.wrapping_mul(10) + (digits >> 8)) & 0x00ff_00ff_00ff_00ff;
+    let quads = (pairs.wrapping_mul(100) + (pairs >> 16)) & 0x0000_ffff_0000_ffff;
+    ((quads as u32 as i64) * 10_000) + (quads >> 32) as i64
+}
+
 pub fn unsigned(bytes: &[u8]) -> Option<i64> {
+    if bytes.len() == 13 {
+        const ASCII_ZERO: u64 = 0x3030_3030_3030_3030;
+        // Split into five and eight digits with two in-bounds overlapping loads.
+        let first = (u64::from_le_bytes(bytes[..8].try_into().unwrap()) ^ ASCII_ZERO) << 24;
+        let last = u64::from_le_bytes(bytes[5..13].try_into().unwrap()) ^ ASCII_ZERO;
+        if (first | last) & 0xf0f0_f0f0_f0f0_f0f0 != 0
+            || (first.wrapping_add(0x0606_0606_0606_0606)
+                | last.wrapping_add(0x0606_0606_0606_0606))
+                & 0x1010_1010_1010_1010
+                != 0
+        {
+            return None;
+        }
+        return Some(eight_digits(first) * 100_000_000 + eight_digits(last));
+    }
     if bytes.is_empty() {
         return None;
     }
@@ -214,12 +287,7 @@ pub fn unsigned(bytes: &[u8]) -> Option<i64> {
                 return None;
             }
             // Combine eight decimal digits in pairs, then as two 4-digit values.
-            let pairs = (digits.wrapping_mul(10) + (digits >> 8)) & 0x00ff_00ff_00ff_00ff;
-            let quads = (pairs.wrapping_mul(100) + (pairs >> 16)) & 0x0000_ffff_0000_ffff;
-            (
-                ((quads as u32 as i64) * 10000) + ((quads >> 32) as i64),
-                &bytes[8..],
-            )
+            (eight_digits(digits), &bytes[8..])
         } else {
             (0, bytes)
         };
@@ -290,7 +358,8 @@ impl TimestampParser {
     fn midnight(&mut self, bytes: &[u8]) -> Option<i64> {
         let year_month = u64::from_le_bytes(bytes[..8].try_into().unwrap());
         let day_bytes = u16::from_le_bytes([bytes[8], bytes[9]]);
-        let day = (bytes[8] & 15) * 10 + (bytes[9] & 15);
+        // Modulo 32 this is 10 × the tens digit plus the units digit.
+        let day = (u32::from(day_bytes) * 2561) >> 8;
         let slot = &mut self.dates[(day & 31) as usize];
         if slot.year_month != year_month || slot.day_bytes != day_bytes {
             if bytes[4] != b'-' || bytes[7] != b'-' {
@@ -334,12 +403,7 @@ impl TimestampParser {
         {
             return None;
         }
-        let hour = pair(bytes, 11);
-        let minute = pair(bytes, 14);
-        let second = pair(bytes, 17);
-        if hour > 23 || minute > 59 || second > 59 {
-            return None;
-        }
+        let seconds = clock_seconds::<true>(clock)?;
         let offset = if bytes.len() == 20 {
             if bytes[19] != b'Z' {
                 return None;
@@ -356,7 +420,7 @@ impl TimestampParser {
             }
             (hours * 60 + minutes) * if bytes[19] == b'+' { 60 } else { -60 }
         };
-        Some(self.midnight(bytes)? + (hour * 3600 + minute * 60 + second - offset) * 1000)
+        Some(self.midnight(bytes)? + (seconds - offset) * 1000)
     }
 
     /// The input contract guarantees that ingest_ts has valid UTC F1 syntax.
@@ -365,13 +429,26 @@ impl TimestampParser {
         let bytes: &[u8; 20] = bytes.try_into().expect("ingest_ts must be valid F1");
         self.midnight(bytes)
             .expect("ingest_ts must have a calendar date")
-            + (pair(bytes, 11) * 3600 + pair(bytes, 14) * 60 + pair(bytes, 17)) * 1000
+            + clock_seconds::<false>(
+                u64::from_le_bytes(bytes[11..19].try_into().unwrap()) & 0x0f0f_000f_0f00_0f0f,
+            )
+            .unwrap()
+                * 1000
     }
 }
 
 #[inline]
-fn pair(bytes: &[u8], start: usize) -> i64 {
-    i64::from(bytes[start] & 15) * 10 + i64::from(bytes[start + 1] & 15)
+fn clock_seconds<const VALIDATE: bool>(clock: u64) -> Option<i64> {
+    // Each two-digit decimal pair occupies its own 24-bit lane.
+    const TENS: u64 = 0x000f_0000_0f00_000f;
+    let pairs = (clock & TENS) * 10 + ((clock >> 8) & TENS);
+    if VALIDATE && (pairs + 0x00c4_0000_c400_00e8) & 0x0100_0001_0000_0100 != 0 {
+        return None;
+    }
+    let hour = (pairs as u8) as i64;
+    let minute = ((pairs >> 24) as u8) as i64;
+    let second = (pairs >> 48) as i64;
+    Some(hour * 3600 + minute * 60 + second)
 }
 
 #[cfg(test)]

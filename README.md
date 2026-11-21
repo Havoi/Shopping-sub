@@ -70,41 +70,40 @@ installed. `Cargo.lock` pins the dependency graph used by the Docker build.
 
 ## Local measurements
 
-The team reported an 8-second practice score for the earlier commit
-`d6783e0`. These measurements compare that image with this one on a Ryzen 5
-5600H laptop. Each run used a fresh container, eight pinned hardware threads
-across four cores, 6 GiB, no swap, read-only inputs and disabled networking.
+The team reports **1.52 s on the portal** for commit `36e2f49` and 8 s
+for its predecessor `d6783e0`. The comparisons below use `36e2f49` and
+this release on a Ryzen 5 5600H. Each sample is a fresh container with eight
+pinned hardware threads on four cores, 6 GiB, no swap, read-only input and
+no network. Durations come from Docker's start and exit timestamps.
 
-| Official generator, seed 2026, 20M events + 5M clicks | Previous | Optimized |
-| --- | ---: | ---: |
-| Warm Linux filesystem, median of three per image | 9.538 s | 2.009 s |
-| Linux input page cache evicted, one run per image | 9.850 s | 4.009 s |
+| 20M events + 5M clicks | Runs per image | 1.52 s submission | This release |
+|---|---:|---:|---:|
+| Seed 2026, warm Linux input | 5 | 1.985 s | **1.275 s** |
+| Seed 73, warm Linux input | 3 | 1.972 s | **1.267 s** |
+| Seed 2026, Linux input cache evicted | 3 | 4.487 s | 4.026 s |
 
-Times use Docker's container start and exit timestamps. The warm trials ran
-in alternating order on identical input. The optimized times were 1.954,
-2.009 and 2.084 seconds. Before each cache-eviction trial, Linux reported
-zero of 459,975 input pages resident. The host's underlying storage cache
-was uncontrolled.
+All values are medians. Old and new containers ran in interleaved order on
+identical input. Seed 73 was held out of tuning. Linux reported zero of the
+459,975 input pages resident before every evicted run. The underlying
+storage cache was uncontrolled. The fastest practice-scale release trial
+took 1.189 s from start to exit and 0.996 s inside the executable.
 
-Scaling the team's 8-second score by each measured ratio gives 1.69 seconds
-with warm input and 3.26 seconds after eviction. A practical estimate is
-2�3 seconds, with a wider 1.5�4 second planning range. The hidden seed,
-hardware, and input cache state determine the official score.
+Applying the warm runtime ratios to the team's 1.52 s portal score gives
+**about 0.98 s** on either seed. The cache-evicted ratio gives 1.36 s.
+The new portal score and rank require a submission. The measured local
+median exceeds the 1.000 s target, and a 0.300 s portal score remains open.
 
-A separate 60M-event, 15M-click run on seed 99 used a Windows-mounted
-directory for both images. Docker CLI wall time fell from 54.82 to
-28.63 seconds and peak container memory fell from 6.00 to 4.52 GiB.
-On a native Linux filesystem, three optimized containers took 33.552,
-12.051 and 11.241 seconds from start to exit (median 12.051 seconds).
-The WSL VM has 7.4 GiB total. File cache and the process compete for RAM
-at final scale.
+On final-size seed 99 (60M events and 15M clicks), three optimized
+containers took 12.070, 9.587, 5.450 s. The median was **9.587 s**.
+The WSL VM has 7.4 GiB RAM. Input pages compete with working memory at
+this size, which contributes to the spread between runs.
 
-Both tables matched the public million-event answer and all 36 fixtures.
-Three extra seeds, a long identity chain, compact and full-width duplicate
-records, and sparse campaign totals matched the independent Python reference.
-Every output key and value at 20M and 60M matched the earlier verified image,
-including 2,224,281 and 6,648,247 user/day rows respectively and 28,014
-campaign/day rows per dataset. Large generated datasets have no published
+The release passed all 36 official fixtures and both CPU builds matched
+the public million-event answer exactly. Twelve additional datasets covered
+three independent seeds and nine adversarial cases, including fingerprint
+collisions and timestamp-width boundaries.
+Both entire output tables matched the previous verified implementation on
+the two 20M seeds and the 60M seed. Large generated inputs have no published
 golden answers.
 
 For the 60M input, a scratch copy of the official generator wrote shards
@@ -113,34 +112,36 @@ generator files byte for byte before use. Generation is outside timed runs.
 
 ## How the implementation works
 
-1. Read every CSV shard and skip its own header. The tuned parser scans comma,
-   newline and quote positions with AVX2. It checks that quoted fields open
-   and close at the correct boundaries. Longer rows use the same strict scalar
-   rules. Calendar validation is cached by date and timestamps retain millisecond
-   precision.
-2. Build the transitive graph of linked user IDs with union-find while other
-   threads scan the events. Keep the smallest UTF-8 name in each component.
-   Short user names fit in a machine word. All other names retain their exact
-   bytes in an interner. An event can be scanned before the graph finishes
-   because its raw user key can be resolved afterward.
-3. Partition by **event ID** and choose the earliest ingestion across all files.
-   An invalid earliest copy still suppresses a later valid copy, even if the
-   copies name different users. Two bitmaps identify hash slots that occur only
-   once. A repeated slot always goes through exact key comparisons. The common
-   nonpurchase record occupies 24 bytes including its event key. Purchases,
-   longer IDs and wider time ranges have full-width representations.
-4. Partition surviving events and valid clicks by canonical person. Sort each
-   partition by person and time, breaking click ties by original ID bytes.
-   An adjacent gap greater than 1,800,000 ms starts a session. All its events
-   and revenue belong to the UTC day on which it started.
-5. Move two indices through the person's sorted clicks as session starts
-   advance. The inclusive seven-day window supplies both the last eligible
-   click and all the distinct assisting campaigns. Small campaign/day tables
-   use direct indexing. Large calendars or catalogs use a sparse table.
-6. Write each shard's user rows directly to Parquet. Consecutive rows for a
-   person share one dictionary entry and a run-length encoded index. Merge
-   campaign counts across shards and write the campaign table. Empty outputs
-   still carry the required schema.
+1. Read each CSV shard and skip its own header. The tuned parser classifies
+   commas, newlines and quotes in blocks, and checks both quote boundaries.
+   Validated calendar dates are cached. The timestamp path also handles integer
+   epoch milliseconds and UTC offsets. Long rows use a scalar parser.
+2. Parse identity edges while reading event rows. An open-addressed table
+   doubles as a union-find forest. Roots are selected by UTF-8 byte order.
+   After union, each occupied slot contains its canonical name, including
+   identities that only appear in the link files.
+3. Partition event IDs independently of their payloads. An ID entry records
+   the ingestion time and the location of its payload. A bitmap slot seen
+   once proves a row is unique. For repeated slots, an owner table compares
+   the full ID before suppressing a later copy. An invalid earliest copy
+   still suppresses later valid ones. Payloads are grouped by raw user key
+   so nearby identity lookups share cache lines.
+4. Group surviving events and valid clicks by canonical person. In short
+   windows, an event's millisecond offset, price and category fit in a single
+   64-bit value after grouping. A grouped click uses 16 bytes and retains
+   a locator for its original ID. Wider timestamps and catalogs use larger
+   representations. Only a timestamp tie requires reading click ID bytes.
+5. Sort ordinary shoppers' events by time. For high-volume shoppers in a
+   bounded window, aggregate into half-hour bins. Every event within one bin
+   belongs to one session. Two occupied bins join when the next minimum
+   timestamp is within 30 minutes of the previous maximum. The session's
+   first timestamp sets its UTC reporting date.
+6. Advance two indices over each person's clicks. The inclusive seven-day
+   window determines the latest eligible click and the distinct assisting
+   campaigns. Each shard writes its user/day rows and returns campaign totals
+   for reduction. The writer uses dictionary and run-length encoding for user
+   IDs, dictionary encoding for small category catalogs, and delta encoding
+   for integers. Empty tables still carry the required schema.
 
 For example, a phone view at 23:55 and a linked laptop purchase at 00:10
 belong to one session on the first date. If campaign A had a click two days

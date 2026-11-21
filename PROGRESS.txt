@@ -1,79 +1,91 @@
 Shopping Sessions progress checklist
 Updated 2026-11-21, Asia/Kolkata
 
-Submission
-[x] Implement the event, identity, session, attribution and Parquet rules.
-[x] Publish the first verified solution to Havoi/Shopping-sub, commit d6783e0.
-[x] Record the team's reported practice result of 8 seconds, rank 178.
-    The team reported about 0.5 seconds for first place.
-[x] Build a faster release with both tuned and generic amd64 executables.
-[x] Publish the verified optimized release on the same public main branch.
-[ ] Obtain an official portal score for the new commit.
+Submission and targets
+[x] Implement the rules and publish the original solution, d6783e0.
+    The team reported 8 seconds and rank 178.
+[x] Publish 36e2f49. The team reported 1.52 seconds on the practice portal.
+[x] Build and publish the next verified release on the same main branch.
+[ ] Reach a 20M local container start-to-exit median below 1.000 second.
+    Best release median across the two warm seeds: 1.267 s.
+[ ] Obtain an official score for this release and reach <0.300 s on the portal.
 
-Performance work
-[x] Eliminate the event/click prepass for user interning. Build identity links
-    concurrently with event parsing and retain byte-exact fallback IDs.
-[x] Benchmark SIMD CSV parsing, date caching, shorter event records, and
-    exact global deduplication with a bitmap fast path for singleton slots.
-[x] Compare partition counts, allocation size hints, identity prefetch,
-    comparison and radix sorting, and Parquet encodings end to end.
-[x] Write UTF-8 user IDs as dictionary entries plus run lengths. The writer
-    reproduced all 2,224,281 practice user rows across the 64 old partitions.
-    PyArrow and Polars also decoded synthetic multi-group, Unicode, embedded
-    NUL, and maximum dictionary-width cases.
-[x] Benchmark the old and new release images on the same warm 20M input.
-[x] Measure sensitivity to evicting the Linux input file cache.
-[x] Test 60M events and 15M clicks under a 6 GiB limit with swap disabled.
-[x] Run three fresh final-scale containers on the native Linux filesystem.
+Bottleneck investigation and changes
+[x] Profile 36e2f49. One warm pipeline reached 0.423 s after event parsing
+    and link resolution, 1.002 s after deduplication and clicks, and 1.629 s
+    after grouping and output. Sorting used 2.46 cumulative worker-seconds.
+[x] Scan structural CSV bytes with AVX2 and validate quote boundaries.
+    Specialize clock decoding and common epoch lengths. On a 20.8 MB event
+    shard, CSV plus both timestamps took 7.859 vs 9.362 ms on one CPU core.
+[x] Parse link edges concurrently and build an exact open-addressed union-find
+    table. Select lexical roots, compress paths and reuse the table for lookup.
+[x] Partition event IDs separately from payloads. Bitmap-singleton IDs bypass
+    the owner table. Repeated slots check full IDs; earlier invalid copies win.
+    Batch identity lookup by raw user. Retain wide timestamps and arbitrary IDs.
+[x] Group by person before sorting. Store short-window event sort keys in one
+    word and grouped clicks in 16 bytes; use full-width representations as
+    needed. Retrieve click IDs from the original CSV only on timestamp ties.
+[x] Aggregate heavy shoppers into half-hour bins. Exact minimum/maximum
+    timestamps preserve the strict 30-minute boundary across occupied bins.
+[x] Compare Parquet encodings. On 2,224,281 actual user/day rows the writer
+    stage fell from 149 to 98 ms on one core and 24.70 to 20.45 MB.
+    Test dictionary, null, multi-row-group and numeric boundaries with two readers.
+[x] Compare task scheduling, partition counts, allocation hints, transparent
+    huge pages, alternate allocators, prefetching and source-location layouts.
+    The packaged glibc allocator requests transparent huge pages where available.
+    Explicit Linux read-ahead hints gave mixed results on warm and evicted input.
+[x] Compare extra ID census passes, parallel atomic graphs, radix alternatives,
+    and compiler PGO. Profile training used the public dev set. The PGO trial's
+    1.320 s pipeline median was level with its 1.316 s unprofiled control.
+[x] Measure container overhead independently. A fresh /bin/true container on
+    this machine had a 0.245 s median across five trials.
 
-20M practice benchmark, official generator, seed 2026, plus 5M clicks
-Eight pinned hardware threads on four Ryzen 5 5600H cores, 6 GiB, fresh
-Docker containers, read-only inputs and root, uid 1000, no network or swap.
-The duration is the Docker start timestamp through its exit timestamp.
+Release measurements
+Fresh restricted linux/amd64 container per trial, Ryzen 5 5600H, eight pinned
+threads across four cores, 6 GiB, no swap, network disabled, UID 1000.
+Every number below is container start to exit. Times in seconds, in run order.
 
-                    Warm trials in run order (seconds)    Warm median    Evicted
-  Previous image    9.538, 9.343, 9.962                   9.538          9.850
-  Optimized image   2.009, 1.954, 2.084                   2.009          4.009
+20M events + 5M clicks, seed 2026, warm input
+  36e2f49  4.109, 1.936, 2.004, 1.876, 1.985    median 1.985
+  Release  2.152, 1.429, 1.274, 1.189, 1.275    median 1.275
 
-The six warm trials were interleaved. Eviction was per input file. Linux
-reported 0 of 459,975 input pages resident before each evicted run. The
-underlying host storage cache was uncontrolled. Each evicted timing is one run.
+20M + 5M, seed 73, held out of tuning, warm input
+  36e2f49  2.185, 1.962, 1.972    median 1.972
+  Release  2.303, 1.230, 1.267    median 1.267
+
+20M + 5M, seed 2026, zero Linux input pages resident before each run
+  36e2f49  3.763, 4.487, 4.988    median 4.487
+  Release  4.125, 4.026, 3.222    median 4.026
+  Host storage cache was uncontrolled. Each image ran three times.
+
+60M + 15M, seed 99, native Linux filesystem
+  Release  12.070, 9.587, 5.450    median 9.587
+  All three completed within 180 seconds. The prior release's previously
+  measured median on the same final-scale data was 12.051 s.
+
+Alternate 8-thread topology on six physical cores, seed 2026, warm
+  Old/new medians 1.891/1.319 s. Kept the four-core topology as the
+  primary benchmark for continuity.
 
 Portal estimate
-Applying the two local ratios to the team's reported 8-second score gives
-1.69 seconds warm and 3.26 seconds after eviction. Plan around 2-3 seconds,
-with a wider 1.5-4 second range for hardware, seed and cache differences.
-Only the portal can establish the new score or rank.
+Warm ratios on the two seeds give 0.98 and 0.98 s when applied to the
+team's 1.52 s score. Applying the cache-evicted ratio gives 1.36 s.
+These are empirical projections. Hidden seed, storage and CPU may differ.
 
-60M final-scale benchmark, official generator, seed 99, plus 15M clicks
-Same Windows-mounted files and 6 GiB cap used for the earlier measurement.
-  Previous image: 54.82 seconds Docker wall, 52.293 seconds pipeline, 6.00 GiB peak.
-  Optimized image: 28.63 seconds Docker wall, 27.173 seconds pipeline, 4.52 GiB peak.
-Native Linux filesystem, three fresh container start-to-exit measurements:
-  33.552, 12.051 and 11.241 seconds, median 12.051 seconds.
-The input was read once before these trials. The entire WSL VM has 7.4 GiB,
-so the input and working allocations compete for RAM at final scale.
-The 60M generator used an incremental scratch writer to fit local memory.
-Its seed-1 outputs matched all 87 original generator files byte for byte.
-
-Correctness and packaging
-[x] Earlier submission passed all 36 official fixtures, matched the public
-    development answer and three independent seeds, and passed large-data checks.
-[x] Pass all 8 release unit tests in both tuned and generic builds.
-[x] Pass all 36 official fixtures with the optimized Docker entry point.
-[x] Match the public million-event development answer in tuned and generic mode:
-    117,038 user/day rows and 27,400 campaign/day rows, zero differences.
-[x] Match seeds 2, 17 and 42, and the 1,000-link adversarial identity case.
-[x] Check compact and full-width duplicate candidates, long windows and
-    sparse campaign totals against the independent Python reference.
-[x] Compare every row and schema from seed 2026 (20M) and seed 99 (60M)
-    with earlier verified outputs, checking unique keys.
-    User/day rows: 2,224,281 (20M), 6,648,247 (60M). Campaign/day rows:
-    28,014 in each. Every schema, key and value matched. At full scale the
-    two tables agree on 10,055,848 sessions and 19,223,422,711 revenue cents.
-    Large comparisons use the previous verified image; official answers are
-    published for the fixtures and the public million-event development set.
-[x] Verify image size: 29,430,144 bytes. Generated data and scratch stay on D:.
+Verification and packaging
+[x] Pass 10 Rust unit tests on both tuned and generic CPU builds.
+[x] Pass all 36 official fixtures through the final container entry point.
+[x] Match the official dev answer in both CPU modes: 117,038 user/day and
+    27,400 campaign/day rows, zero differences.
+[x] Match the independent reference on seeds 2, 17 and 42, plus nine adversarial
+    datasets covering long links, ID hash collisions, the highest legal compact
+    click offset, timestamp ties, singleton-heavy shards, and wide catalogs.
+[x] Compare every column and key against previously verified outputs.
+    User/day rows: 2,224,281 (seed 2026), 2,230,619 (73), 6,648,247 (99).
+    Campaign/day rows: 28,014 per dataset. Zero differing rows or duplicate keys.
+    At final scale: 10,055,848 sessions and 19,223,422,711 revenue cents.
+[x] Image size 29,538,168 bytes. Generic amd64 fallback included.
+[x] Keep generated inputs, outputs, profiles and experimental binaries outside Git.
 
 Workspace: D:\Sem2\Sem 5\Buildathon\Shopping-Databrics
 Scratch and measurements: D:\ChatGPT-Codex\tmp\shopping-sessions

@@ -18,6 +18,13 @@ use parse::{timestamp, DAY, SESSION_GAP, WEEK};
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 type CampaignTotals = AHashMap<(u32, i32), CampaignStats>;
 
+// Use separate bits of the same uniformly mixed word for owner partitions,
+// person partitions and the lookup table inside each person partition.
+#[inline]
+fn mix_key(key: u64) -> u64 {
+    (key ^ (key >> 29)).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+}
+
 #[derive(Clone, Copy)]
 struct PersonEvent {
     person: u64,
@@ -26,11 +33,35 @@ struct PersonEvent {
     category: u32,
 }
 
-struct Click<'a> {
-    person: u64,
-    id: &'a [u8],
-    ts: i64,
+trait ClickTime: Copy + Default + Ord + Send + Sync {
+    fn encode(timestamp: i64, origin: i64) -> Self;
+}
+
+impl ClickTime for u32 {
+    #[inline]
+    fn encode(timestamp: i64, origin: i64) -> Self {
+        // The compact path checks the entire inclusive click range once.
+        (timestamp - origin) as u32
+    }
+}
+
+impl ClickTime for i64 {
+    #[inline]
+    fn encode(timestamp: i64, _: i64) -> Self {
+        timestamp
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct Ad<C> {
+    id: u64,
+    time: C,
     campaign: u32,
+}
+
+struct KeyedClick<C> {
+    person: u64,
+    click: Ad<C>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -141,7 +172,8 @@ impl DailyCampaigns {
     }
 }
 
-struct Context {
+struct Context<'a> {
+    click_sources: Vec<&'a [u8]>,
     people: People,
     dimensions: Dimensions,
     start: i64,
@@ -152,13 +184,24 @@ struct Context {
     output: PathBuf,
 }
 
-impl Context {
+impl Context<'_> {
+    fn click_origin(&self) -> i64 {
+        self.start.saturating_sub(WEEK)
+    }
+
+    // An ID is the first field of a validated click row. The parser has
+    // already stripped its opening quote, and the following comma or quote
+    // always terminates the value, even when it contains NUL or UTF-8 bytes.
+    fn click_id(&self, id: u64) -> &[u8] {
+        let data = &self.click_sources[(id >> 32) as usize][id as u32 as usize..];
+        &data[..memchr::memchr2(b',', b'"', data).expect("a validated click has four fields")]
+    }
     fn person(&self, user: &[u8]) -> u64 {
         self.people.resolve(user)
     }
 
     fn person_shard(&self, person: u64) -> usize {
-        self.hash.hash_one(person) as usize & (self.person_shards - 1)
+        ((mix_key(person) >> 32) as usize) & (self.person_shards - 1)
     }
 }
 
@@ -175,14 +218,6 @@ fn transpose<T>(groups: Vec<Vec<Vec<T>>>, count: usize) -> Vec<Vec<Vec<T>>> {
                 result[index].push(values);
             }
         }
-    }
-    result
-}
-
-fn flatten<T>(parts: Vec<Vec<T>>) -> Vec<T> {
-    let mut result = Vec::with_capacity(parts.iter().map(Vec::len).sum());
-    for mut part in parts {
-        result.append(&mut part);
     }
     result
 }
@@ -217,8 +252,11 @@ impl Attribution {
         self.winner = None;
     }
 
-    fn advance(&mut self, clicks: &[Click<'_>], start: i64, organic: u32) -> u32 {
-        while self.tail < clicks.len() && clicks[self.tail].ts <= start {
+    fn advance<C: ClickTime>(&mut self, clicks: &[Ad<C>], start: i64, context: &Context) -> u32 {
+        let origin = context.click_origin();
+        let latest = C::encode(start, origin);
+        let earliest = C::encode(start.saturating_sub(WEEK), origin);
+        while self.tail < clicks.len() && clicks[self.tail].time <= latest {
             let click = &clicks[self.tail];
             let campaign = click.campaign as usize;
             if self.counts[campaign] == 0 {
@@ -226,16 +264,18 @@ impl Attribution {
                 self.active.push(click.campaign);
             }
             self.counts[campaign] += 1;
-            // Sorting ascending by ID puts the smallest ID first at each ts.
-            if self
-                .winner
-                .is_none_or(|winner| clicks[winner].ts < click.ts)
-            {
+            // Only timestamp ties require looking up the original ID bytes.
+            if self.winner.is_none_or(|winner| {
+                let old = &clicks[winner];
+                old.time < click.time
+                    || (old.time == click.time
+                        && context.click_id(click.id) < context.click_id(old.id))
+            }) {
                 self.winner = Some(self.tail);
             }
             self.tail += 1;
         }
-        while self.head < self.tail && clicks[self.head].ts < start - WEEK {
+        while self.head < self.tail && clicks[self.head].time < earliest {
             let campaign = clicks[self.head].campaign as usize;
             self.counts[campaign] -= 1;
             if self.counts[campaign] == 0 {
@@ -249,7 +289,7 @@ impl Attribution {
         }
         self.winner
             .filter(|&winner| winner >= self.head)
-            .map_or(organic, |winner| clicks[winner].campaign)
+            .map_or(context.dimensions.organic, |winner| clicks[winner].campaign)
     }
 }
 
@@ -270,48 +310,338 @@ fn finish_day(rows: &mut Vec<UserDay>, mut row: UserDay, categories: &mut [i64])
     rows.push(row);
 }
 
-fn process_people(
-    events: Vec<Vec<PersonEvent>>,
-    clicks: Vec<Vec<Click<'_>>>,
+// Event timestamps are stored separately from person identity after partitioning.
+// A short window fits an exact millisecond timestamp and a purchase index in
+// one sortable word. All other manifests retain full-width event fields.
+struct KeyedEvent<T> {
+    person: u64,
+    data: T,
+}
+trait GroupEvent: Copy + Default + Ord + Send + Sync {
+    fn from_packed(offset: u32, finance: u32, start: i64) -> Self {
+        Self::pack(
+            PersonEvent {
+                person: 0,
+                ts: start + i64::from(offset),
+                revenue: finance & 0xff_ffff,
+                category: finance >> 24,
+            },
+            start,
+        )
+    }
+    fn pack(row: PersonEvent, start: i64) -> Self;
+    fn time(self, start: i64) -> i64;
+    fn purchase(self) -> Option<(u32, u32)>;
+}
+
+impl GroupEvent for u64 {
+    #[inline]
+    fn from_packed(offset: u32, finance: u32, _: i64) -> Self {
+        (u64::from(offset) << 32) | u64::from(finance)
+    }
+    #[inline]
+    fn pack(row: PersonEvent, start: i64) -> Self {
+        // Prices pass ingestion's inclusive 10,000,000-cent limit (24 bits).
+        ((row.ts - start) as u64) << 32 | (u64::from(row.category) << 24) | u64::from(row.revenue)
+    }
+    #[inline]
+    fn time(self, start: i64) -> i64 {
+        start + (self >> 32) as i64
+    }
+    #[inline]
+    fn purchase(self) -> Option<(u32, u32)> {
+        let price = (self as u32) & 0xff_ffff;
+        (price != 0).then_some((price, (self as u32) >> 24))
+    }
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct WideEvent {
+    ts: i64,
+    revenue: u32,
+    category: u32,
+}
+
+impl GroupEvent for WideEvent {
+    fn pack(row: PersonEvent, _: i64) -> Self {
+        Self {
+            ts: row.ts,
+            revenue: row.revenue,
+            category: row.category,
+        }
+    }
+    fn time(self, _: i64) -> i64 {
+        self.ts
+    }
+    fn purchase(self) -> Option<(u32, u32)> {
+        (self.revenue != 0).then_some((self.revenue, self.category))
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct PersonRange {
+    person: u64,
+    event_end: usize,
+    click_end: usize,
+}
+
+#[derive(Clone, Copy)]
+struct TimeBin {
+    first: i64,
+    last: i64,
+    events: i64,
+    revenue: i64,
+}
+
+#[derive(Default)]
+struct BinScratch {
+    bins: Vec<TimeBin>,
+    revenue: Vec<i64>,
+}
+
+impl BinScratch {
+    fn record<T: GroupEvent, C: ClickTime>(
+        &mut self,
+        person: u64,
+        events: &[T],
+        clicks: &[Ad<C>],
+        context: &Context,
+        bin_count: usize,
+        attribution: &mut Attribution,
+        totals: &mut DailyCampaigns,
+        rows: &mut Vec<UserDay>,
+        categories: &mut [i64],
+    ) {
+        // The width equals the allowed inactivity gap. All events in a bin
+        // necessarily belong to one session. For two adjacent occupied bins
+        // only the previous maximum and the next minimum can separate them.
+        let empty = TimeBin {
+            first: i64::MAX,
+            last: i64::MIN,
+            events: 0,
+            revenue: 0,
+        };
+        self.bins.clear();
+        self.bins.resize(bin_count, empty);
+        self.revenue.clear();
+        self.revenue.resize(bin_count * categories.len(), 0);
+        for event in events {
+            let ts = event.time(context.start);
+            let index = ((ts - context.start) / SESSION_GAP) as usize;
+            let bin = &mut self.bins[index];
+            bin.first = bin.first.min(ts);
+            bin.last = bin.last.max(ts);
+            bin.events += 1;
+            if let Some((revenue, category)) = event.purchase() {
+                self.revenue[index * categories.len() + category as usize] += i64::from(revenue);
+                bin.revenue += i64::from(revenue);
+            }
+        }
+        let mut current: Option<UserDay> = None;
+        let mut at = 0;
+        while at < self.bins.len() {
+            let first = self.bins[at];
+            if first.events == 0 {
+                at += 1;
+                continue;
+            }
+            let day = first.first.div_euclid(DAY) as i32;
+            if current.as_ref().is_some_and(|row| row.day != day) {
+                finish_day(rows, current.take().unwrap(), categories);
+            }
+            let row = current.get_or_insert(UserDay {
+                person,
+                day,
+                sessions: 0,
+                events: 0,
+                revenue: 0,
+                category: None,
+            });
+            let mut last = first.first;
+            let mut revenue = 0;
+            while at < self.bins.len() {
+                let bin = self.bins[at];
+                if bin.events != 0 {
+                    if bin.first - last > SESSION_GAP {
+                        break;
+                    }
+                    row.events += bin.events;
+                    revenue += bin.revenue;
+                    if bin.revenue != 0 {
+                        let begin = at * categories.len();
+                        for (category, subtotal) in
+                            categories.iter_mut().zip(&self.revenue[begin..])
+                        {
+                            *category += subtotal;
+                        }
+                    }
+                    last = bin.last;
+                }
+                at += 1;
+            }
+            row.sessions += 1;
+            row.revenue += revenue;
+            let campaign = attribution.advance(clicks, first.first, context);
+            totals.record(day, campaign, revenue, &attribution.active);
+        }
+        if let Some(row) = current {
+            finish_day(rows, row, categories);
+        }
+    }
+}
+
+fn group_people<T: GroupEvent, C: ClickTime>(
+    mut events: Vec<Vec<KeyedEvent<T>>>,
+    mut clicks: Vec<Vec<KeyedClick<C>>>,
     shard: usize,
     context: &Context,
+    count: usize,
 ) -> Result<DailyCampaigns> {
-    let mut events = flatten(events);
-    let mut clicks = flatten(clicks);
-    events.sort_unstable_by(|a, b| a.person.cmp(&b.person).then(a.ts.cmp(&b.ts)));
-    clicks.sort_unstable_by(|a, b| {
-        a.person
-            .cmp(&b.person)
-            .then(a.ts.cmp(&b.ts))
-            .then_with(|| a.id.cmp(b.id))
-    });
-    // Copies are identical after CSV parsing. They are adjacent in this order.
-    clicks.dedup_by(|a, b| a.person == b.person && a.ts == b.ts && a.id == b.id);
-    let mut rows = Vec::new();
+    // The usual case needs only one cache-line probe for both identity and
+    // counts. A separate overflow map keeps the probe bound fixed even for a
+    // shard in which every event has a different person.
+    let slots = (count / 16).max(16).next_power_of_two();
+    let mask = slots - 1;
+    let shift = 64 - slots.trailing_zeros();
+    let first_slot = |person: u64| {
+        let bits = mix_key(person);
+        (bits >> shift) as usize
+    };
+    let mut ranges = vec![PersonRange::default(); slots];
+    let mut overflow = AHashMap::new();
+    for row in events.iter_mut().flatten() {
+        let first = first_slot(row.person);
+        let mut found = None;
+        for probe in 0..8 {
+            let slot = first.wrapping_add(probe) & mask;
+            let range = &mut ranges[slot];
+            if range.person == row.person || range.event_end == 0 {
+                range.person = row.person;
+                found = Some(slot);
+                break;
+            }
+        }
+        let group = found.unwrap_or_else(|| {
+            *overflow.entry(row.person).or_insert_with(|| {
+                let index = ranges.len();
+                ranges.push(PersonRange {
+                    person: row.person,
+                    event_end: 0,
+                    click_end: 0,
+                });
+                index
+            })
+        });
+        ranges[group].event_end += 1;
+        row.person = group as u64;
+    }
+    for row in clicks.iter_mut().flatten() {
+        let first = first_slot(row.person);
+        let mut found = None;
+        let mut missed = false;
+        for probe in 0..8 {
+            let slot = first.wrapping_add(probe) & mask;
+            let range = &ranges[slot];
+            if range.event_end == 0 {
+                missed = true;
+                break;
+            }
+            if range.person == row.person {
+                found = Some(slot);
+                break;
+            }
+        }
+        if let Some(group) = found.or_else(|| {
+            if missed {
+                None
+            } else {
+                overflow.get(&row.person).copied()
+            }
+        }) {
+            ranges[group].click_end += 1;
+            row.person = group as u64;
+        } else {
+            row.person = u64::MAX;
+        }
+    }
+    drop(overflow);
+    let mut event_count = 0;
+    let mut click_count = 0;
+    for range in &mut ranges {
+        let next_event = event_count + range.event_end;
+        let next_click = click_count + range.click_end;
+        range.event_end = event_count;
+        range.click_end = click_count;
+        event_count = next_event;
+        click_count = next_click;
+    }
+
+    let mut grouped_events = vec![T::default(); event_count];
+    for row in events.into_iter().flatten() {
+        let cursor = &mut ranges[row.person as usize].event_end;
+        grouped_events[*cursor] = row.data;
+        *cursor += 1;
+    }
+    let mut grouped_clicks = vec![Ad::default(); click_count];
+    for row in clicks.into_iter().flatten() {
+        if row.person != u64::MAX {
+            let cursor = &mut ranges[row.person as usize].click_end;
+            grouped_clicks[*cursor] = row.click;
+            *cursor += 1;
+        }
+    }
+    let mut rows = Vec::with_capacity(event_count / 10);
     let mut totals = DailyCampaigns::new(context);
     let mut categories = vec![0i64; context.dimensions.categories.len()];
     let mut attribution = Attribution::new(context.dimensions.campaign_names.len());
-    let mut click_at = 0;
-    for person_events in events.chunk_by(|a, b| a.person == b.person) {
-        let person = person_events[0].person;
-        while click_at < clicks.len() && clicks[click_at].person < person {
-            click_at += 1;
+
+    let mut event_begin = 0;
+    let mut click_begin = 0;
+    let mut bins = BinScratch::default();
+    let bin_count = context
+        .end
+        .abs_diff(context.start)
+        .div_ceil(SESSION_GAP as u64);
+    let bin_count = usize::try_from(bin_count).unwrap_or(usize::MAX);
+    let use_bins = bin_count.saturating_mul(categories.len().max(1)) <= 131_072;
+    for range in ranges {
+        if range.event_end == event_begin {
+            continue;
         }
-        let first_click = click_at;
-        while click_at < clicks.len() && clicks[click_at].person == person {
-            click_at += 1;
-        }
-        let person_clicks = &clicks[first_click..click_at];
+        let person = range.person;
+        let person_events = &mut grouped_events[event_begin..range.event_end];
+        let person_clicks = &mut grouped_clicks[click_begin..range.click_end];
+        event_begin = range.event_end;
+        click_begin = range.click_end;
+        // Identical click copies enter and leave together. Both the latest
+        // eligible click and the set of active campaigns are unchanged.
+        person_clicks.sort_unstable_by_key(|row| row.time);
         attribution.reset();
+        if use_bins && person_events.len() >= bin_count.saturating_mul(2).max(256) {
+            bins.record(
+                person,
+                person_events,
+                person_clicks,
+                context,
+                bin_count,
+                &mut attribution,
+                &mut totals,
+                &mut rows,
+                &mut categories,
+            );
+            continue;
+        }
+        person_events.sort_unstable();
         let mut current: Option<UserDay> = None;
         let mut at = 0;
         while at < person_events.len() {
             let first = at;
-            let start = person_events[first].ts;
+            let start = person_events[first].time(context.start);
             let day = start.div_euclid(DAY) as i32;
             at += 1;
             while at < person_events.len()
-                && person_events[at].ts - person_events[at - 1].ts <= SESSION_GAP
+                && person_events[at].time(context.start) - person_events[at - 1].time(context.start)
+                    <= SESSION_GAP
             {
                 at += 1;
             }
@@ -328,15 +658,15 @@ fn process_people(
             });
             let mut revenue = 0i64;
             for event in &person_events[first..at] {
-                if event.revenue != 0 {
-                    revenue += event.revenue as i64;
-                    categories[event.category as usize] += event.revenue as i64;
+                if let Some((value, category)) = event.purchase() {
+                    revenue += i64::from(value);
+                    categories[category as usize] += i64::from(value);
                 }
             }
             row.sessions += 1;
             row.events += (at - first) as i64;
             row.revenue += revenue;
-            let campaign = attribution.advance(person_clicks, start, context.dimensions.organic);
+            let campaign = attribution.advance(person_clicks, start, context);
             totals.record(day, campaign, revenue, &attribution.active);
         }
         if let Some(row) = current {
@@ -352,6 +682,47 @@ fn process_people(
         &context.people,
         &context.dimensions,
     )?;
+    Ok(totals)
+}
+
+fn aggregate<T: GroupEvent>(
+    raw: ingest::EventParts<'_>,
+    context: &Context,
+    started: Instant,
+) -> Result<CampaignTotals> {
+    // Window end is exclusive. The inclusive last millisecond may be exactly
+    // u32::MAX after the lookback origin without losing any timestamp.
+    if (context.end - 1).abs_diff(context.click_origin()) <= u64::from(u32::MAX) {
+        aggregate_clicks::<T, u32>(raw, context, started)
+    } else {
+        aggregate_clicks::<T, i64>(raw, context, started)
+    }
+}
+
+fn aggregate_clicks<T: GroupEvent, C: ClickTime>(
+    raw: ingest::EventParts<'_>,
+    context: &Context,
+    started: Instant,
+) -> Result<CampaignTotals> {
+    let (events_by_person, clicks_by_person) = rayon::join(
+        || ingest::finish_events::<T>(raw, context),
+        || ingest::clicks::<C>(context),
+    );
+    eprintln!(
+        "deduplication and clicks {:.3}s",
+        started.elapsed().as_secs_f64()
+    );
+    let totals = events_by_person
+        .into_par_iter()
+        .zip(clicks_by_person)
+        .enumerate()
+        .map(|(shard, (events, clicks))| {
+            let count = events.iter().map(Vec::len).sum();
+            group_people::<T, C>(events, clicks, shard, context, count)
+        })
+        .try_reduce_with(|left, right| Ok(left.merge(right)))
+        .expect("at least one person shard")?
+        .into_totals();
     Ok(totals)
 }
 
@@ -391,6 +762,7 @@ fn run() -> Result<()> {
     let clicks = Inputs::open(&data.join("clicks"))?;
     let small = events.bytes() < 1024 * 1024;
     let context = Context {
+        click_sources: clicks.chunks(),
         people: People::new(),
         dimensions: Dimensions::load(&data)?,
         start,
@@ -399,7 +771,7 @@ fn run() -> Result<()> {
         person_shards: if small {
             1
         } else {
-            (threads * 4).next_power_of_two().min(128)
+            (threads * 8).next_power_of_two().min(128)
         },
         event_shards: if small { 1 } else { 128 },
         output,
@@ -413,22 +785,13 @@ fn run() -> Result<()> {
         started.elapsed().as_secs_f64(),
         context.people.len()
     );
-    let (events_by_person, clicks_by_person) = rayon::join(
-        || ingest::finish_events(raw, &context),
-        || ingest::clicks(&clicks, &context),
-    );
-    eprintln!(
-        "deduplication and clicks {:.3}s",
-        started.elapsed().as_secs_f64()
-    );
-    let totals = events_by_person
-        .into_par_iter()
-        .zip(clicks_by_person)
-        .enumerate()
-        .map(|(shard, (events, clicks))| process_people(events, clicks, shard, &context))
-        .try_reduce_with(|left, right| Ok(left.merge(right)))
-        .expect("at least one person shard")?
-        .into_totals();
+    let totals = if context.end.abs_diff(context.start) <= u64::from(u32::MAX) + 1
+        && context.dimensions.categories.len() <= 256
+    {
+        aggregate::<u64>(raw, &context, started)?
+    } else {
+        aggregate::<WideEvent>(raw, &context, started)?
+    };
     output::campaigns(
         &context.output.join("campaign_daily/part-000.parquet"),
         &totals,
@@ -447,5 +810,54 @@ fn main() {
     if let Err(error) = run() {
         eprintln!("shopping-sessions: {error}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod compact_tests {
+    use super::*;
+
+    #[test]
+    fn compact_sort_key_preserves_timestamp_price_and_category_extremes() {
+        let start = -123_000;
+        let row = PersonEvent {
+            person: 17,
+            ts: start + i64::from(u32::MAX),
+            revenue: 10_000_000,
+            category: 255,
+        };
+        let compact = <u64 as GroupEvent>::pack(row, start);
+        assert_eq!(compact.time(start), row.ts);
+        assert_eq!(compact.purchase(), Some((10_000_000, 255)));
+        assert_eq!(
+            <u64 as GroupEvent>::from_packed(u32::MAX, (255 << 24) | 10_000_000, start),
+            compact
+        );
+        assert!(<u64 as GroupEvent>::from_packed(0, 0, start)
+            .purchase()
+            .is_none());
+        let wide_row = PersonEvent {
+            ts: row.ts + 1,
+            category: 256,
+            ..row
+        };
+        let wide = WideEvent::pack(wide_row, start);
+        assert_eq!(wide.time(start), wide_row.ts);
+        assert_eq!(wide.purchase(), Some((10_000_000, 256)));
+    }
+
+    #[test]
+    fn compact_click_clock_preserves_both_ends_of_the_window() {
+        let origin = -WEEK - 3000;
+        assert_eq!(<u32 as ClickTime>::encode(origin, origin), 0);
+        assert_eq!(
+            <u32 as ClickTime>::encode(origin + i64::from(u32::MAX), origin),
+            u32::MAX
+        );
+        assert_eq!(
+            <i64 as ClickTime>::encode(origin + i64::from(u32::MAX) + 1, origin),
+            origin + i64::from(u32::MAX) + 1
+        );
+        assert_eq!(std::mem::size_of::<Ad<u32>>(), 16);
     }
 }

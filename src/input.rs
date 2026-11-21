@@ -4,6 +4,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 use ahash::AHashMap;
 use memmap2::Mmap;
+use rayon::prelude::*;
 
 use crate::parse::{fields, lines, rows};
 use crate::Result;
@@ -36,12 +37,15 @@ impl Inputs {
     }
 
     pub fn chunks(&self) -> Vec<&[u8]> {
+        self.chunks_with_size(4 * 1024 * 1024)
+    }
+    fn chunks_with_size(&self, chunk_bytes: usize) -> Vec<&[u8]> {
         let mut chunks = Vec::new();
         for map in &self.maps {
             // Each individual file has its own header, even header-only files.
             let mut start = memchr::memchr(b'\n', map).map_or(map.len(), |at| at + 1);
             while start < map.len() {
-                let target = (start + 4 * 1024 * 1024).min(map.len());
+                let target = (start + chunk_bytes).min(map.len());
                 let end = if target == map.len() {
                     target
                 } else {
@@ -128,24 +132,9 @@ struct AliasTable {
 }
 
 impl AliasTable {
-    fn reserve(expected: usize) -> Self {
-        let capacity = (expected + expected / 2 + 8).next_power_of_two();
-        Self {
-            slots: vec![
-                Slot {
-                    key: VACANT,
-                    value: 0
-                };
-                capacity
-            ],
-            shift: 64 - capacity.trailing_zeros(),
-            len: 0,
-        }
-    }
-
     #[inline]
     fn bucket(&self, key: u64) -> usize {
-        let mixed = (key ^ (key >> 29)).wrapping_mul(0x9e3779b97f4a7c15);
+        let mixed = crate::mix_key(key);
         (mixed >> self.shift) as usize
     }
 
@@ -172,46 +161,47 @@ impl AliasTable {
         }
     }
 
-    fn insert(&mut self, key: u64, new_value: u64) -> u64 {
-        // A table with at least one empty slot always terminates probing.
-        if self.len >= self.slots.len() * 2 / 3 {
-            let mut larger = Self::reserve(self.slots.len());
-            for &slot in &self.slots {
-                if slot.key != VACANT {
-                    let index = larger.position(slot.key);
-                    larger.slots[index] = slot;
-                }
-            }
-            larger.len = self.len;
-            *self = larger;
-        }
+    fn vertex(&mut self, key: u64) -> usize {
         let index = self.position(key);
-        let entry = &mut self.slots[index];
-        if entry.key == VACANT {
-            *entry = Slot {
+        let slot = &mut self.slots[index];
+        if slot.key == VACANT {
+            *slot = Slot {
                 key,
-                value: new_value,
+                value: index as u64,
             };
-            self.len += 1;
         }
-        entry.value
+        index
     }
-}
 
-struct Node {
-    parent: u32,
-    size: u32,
-    minimum: u64,
-}
-
-fn root(nodes: &mut [Node], mut id: u32) -> u32 {
-    while nodes[id as usize].parent != id {
-        let parent = nodes[id as usize].parent;
-        let grandparent = nodes[parent as usize].parent;
-        nodes[id as usize].parent = grandparent;
-        id = grandparent;
+    fn root(&mut self, mut index: usize) -> usize {
+        loop {
+            let parent = self.slots[index].value as usize;
+            if index == parent {
+                return index;
+            }
+            let grandparent = self.slots[parent].value as usize;
+            self.slots[index].value = grandparent as u64;
+            if grandparent == parent {
+                return parent;
+            }
+            index = grandparent;
+        }
     }
-    id
+
+    #[inline]
+    fn prefetch(&self, key: u64) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            let slot = &self.slots[self.bucket(key)];
+            // The slot is inside this live table. The instruction is a cache hint.
+            unsafe {
+                _mm_prefetch((slot as *const Slot).cast(), _MM_HINT_T0);
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = key;
+    }
 }
 
 pub struct People {
@@ -228,63 +218,67 @@ impl People {
     }
 
     pub fn load_links(&self, links: &Inputs) {
-        let mut indexes = AliasTable::reserve((links.bytes() / 14).min(4 << 20));
-        let mut nodes = Vec::new();
-        let mut unions = 0;
-        for chunk in links.chunks() {
-            for [a, b] in rows::<2>(chunk) {
-                if a.is_empty() || b.is_empty() {
+        let edges: Vec<Vec<(u64, u64)>> = links
+            .chunks_with_size(128 * 1024)
+            .into_par_iter()
+            .map(|chunk| {
+                rows::<2>(chunk)
+                    .filter(|[a, b]| !a.is_empty() && !b.is_empty() && a != b)
+                    .map(|[a, b]| (self.key(a), self.key(b)))
+                    .collect()
+            })
+            .collect();
+        let count: usize = edges.iter().map(Vec::len).sum();
+        // There are at most two new keys per edge. The table never grows
+        // while parent links refer to its slot indices.
+        let capacity = (count * 2 + count / 2 + 8).next_power_of_two();
+        let mut aliases = AliasTable {
+            slots: vec![
+                Slot {
+                    key: VACANT,
+                    value: 0
+                };
+                capacity
+            ],
+            shift: 64 - capacity.trailing_zeros(),
+            len: 0,
+        };
+        for chunk in edges {
+            for (index, &(a, b)) in chunk.iter().enumerate() {
+                if let Some(&(c, d)) = chunk.get(index + 24) {
+                    aliases.prefetch(c);
+                    aliases.prefetch(d);
+                }
+                let l = aliases.vertex(a);
+                let r = aliases.vertex(b);
+                let left = aliases.root(l);
+                let right = aliases.root(r);
+                if left == right {
                     continue;
                 }
-                let mut component = [0; 2];
-                for (out, name) in component.iter_mut().zip([a, b]) {
-                    let key = self.key(name);
-                    let next = nodes.len() as u64;
-                    let id = indexes.insert(key, next);
-                    if id == next {
-                        nodes.push(Node {
-                            parent: id as u32,
-                            size: 1,
-                            minimum: key,
-                        });
-                    }
-                    *out = root(&mut nodes, id as u32);
-                }
-                let [mut left, mut right] = component.map(|id| id as usize);
-                if left != right {
-                    if nodes[left].size < nodes[right].size {
-                        std::mem::swap(&mut left, &mut right);
-                    }
-                    nodes[right].parent = left as u32;
-                    nodes[left].size += nodes[right].size;
-                    let right_min = nodes[right].minimum;
-                    let left_min = nodes[left].minimum;
-                    // For inline IDs with the same implicit prefix, comparing
-                    // bytes in reverse native order implements UTF-8 byte order.
-                    let less = if (right_min & GENERIC == 0 && left_min & GENERIC == 0)
-                        || (right_min & INTERNED == GENERIC && left_min & INTERNED == GENERIC)
-                    {
-                        right_min.swap_bytes() < left_min.swap_bytes()
-                    } else {
-                        self.name(right_min) < self.name(left_min)
-                    };
-                    if less {
-                        nodes[left].minimum = right_min;
-                    }
-                    unions += 1;
-                }
+                let lk = aliases.slots[left].key;
+                let rk = aliases.slots[right].key;
+                let less = if (lk & GENERIC == 0 && rk & GENERIC == 0)
+                    || (lk & INTERNED == GENERIC && rk & INTERNED == GENERIC)
+                {
+                    lk.swap_bytes() < rk.swap_bytes()
+                } else {
+                    self.name(lk) < self.name(rk)
+                };
+                let (small, large) = if less { (left, right) } else { (right, left) };
+                aliases.slots[large].value = small as u64;
+                aliases.len += 1;
             }
         }
-        // From now on, only aliases need a stored mapping. Every missing key
-        // already encodes its exact singleton or canonical name.
-        let mut aliases = AliasTable::reserve(unions);
-        for slot in indexes.slots {
-            if slot.key != VACANT {
-                let id = root(&mut nodes, slot.value as u32);
-                let canonical = nodes[id as usize].minimum;
-                if slot.key != canonical {
-                    aliases.insert(slot.key, canonical);
-                }
+        for i in 0..capacity {
+            if aliases.slots[i].key != VACANT {
+                aliases.slots[i].value = aliases.root(i) as u64;
+            }
+        }
+        for i in 0..capacity {
+            if aliases.slots[i].key != VACANT {
+                let root = aliases.slots[i].value as usize;
+                aliases.slots[i].value = aliases.slots[root].key;
             }
         }
         assert!(self.aliases.set(aliases).is_ok(), "links already loaded");
@@ -313,21 +307,22 @@ impl People {
         self.long.write().unwrap().intern(name)
     }
 
-    pub fn name(&self, key: u64) -> Vec<u8> {
+    pub fn with_name<T>(&self, key: u64, use_name: impl FnOnce(&[u8]) -> T) -> T {
         if key & INTERNED == INTERNED {
-            return self.long.read().unwrap().names[(key & !INTERNED) as usize].to_vec();
+            let long = self.long.read().unwrap();
+            return use_name(&long.names[(key & !INTERNED) as usize]);
         }
-        let bytes = (key & !GENERIC).to_le_bytes();
-        let length = bytes
-            .iter()
-            .rposition(|&byte| byte != 0)
-            .map_or(0, |index| index + 1);
-        let mut name = Vec::with_capacity(length + 1);
-        if key & GENERIC == 0 {
-            name.push(b'u');
-        }
-        name.extend_from_slice(&bytes[..length]);
-        name
+        let payload = key & !GENERIC;
+        let len = 8 - (payload.leading_zeros() as usize / 8);
+        let mut name = [0u8; 9];
+        name[0] = b'u';
+        name[1..].copy_from_slice(&payload.to_le_bytes());
+        let start = usize::from(key & GENERIC != 0);
+        use_name(&name[start..1 + len])
+    }
+
+    pub fn name(&self, key: u64) -> Vec<u8> {
+        self.with_name(key, |name| name.to_vec())
     }
 
     pub fn len(&self) -> usize {
