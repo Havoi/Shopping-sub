@@ -32,6 +32,24 @@ Critical-path measurements from b86512b
     Single-pass event-ID table         1.484 s   1.320 s
     Bidirectional compaction           1.250 s   1.225 s
     All three together                 1.427 s   1.282 s
+[x] Rebuild the simpler in-place compaction variant as a complete release
+    image and repeat the comparison, adding seed 271828 and 60M events.
+    Input                 b86512b median    In-place median     Runs/image
+    20M, seed 271828             1.370 s            1.416 s              4
+    20M, seed 46091337           1.386 s            1.370 s              4
+    20M, seed 73                 1.271 s            1.326 s              4
+    60M, seed 99                 7.929 s            7.721 s              3
+    At 60M the individual times were 21.476, 7.929, 7.118 s for b86512b
+    and 7.721, 8.111, 5.510 s for the candidate, in fresh 6 GiB containers.
+    Keep the submitted code on main. The practice improvement did not repeat.
+[x] Verify the packaged compaction variant on all 36 official fixtures and 13
+    reference datasets, both complete tables on all four large inputs, and
+    the generic executable against the official dev answer. Both CPU builds
+    passed 13 unit tests, including mixed in-place routing at u32::MAX.
+[x] Move exact event-ID ownership into CSV ingestion and remove its later
+    full-input census. Batched updates to shared tables cost more end to end.
+    With four containers per build, the control/prototype medians were
+    1.293/1.978 s on seed 46091337 and 1.715/2.264 s on seed 73.
 
 [x] Publish b86512b on perf/worker-reuse. All 36 official fixtures and 13
     reference datasets matched, as did all rows on three 20M inputs and one
