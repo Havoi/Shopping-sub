@@ -59,7 +59,7 @@ struct Structural {
     target_feature = "avx2",
     target_feature = "bmi2"
 ))]
-#[inline]
+#[inline(always)]
 fn classify(block: &[u8; 64]) -> Structural {
     let a = classify32(block.first_chunk().unwrap());
     let b = classify32(block[32..].first_chunk().unwrap());
@@ -75,7 +75,7 @@ fn classify(block: &[u8; 64]) -> Structural {
     target_feature = "avx2",
     target_feature = "bmi2"
 ))]
-#[inline]
+#[inline(always)]
 fn classify32(block: &[u8; 32]) -> Structural {
     use std::arch::x86_64::*;
     // The 32-byte load is within the block and AVX2 is enabled.
@@ -107,44 +107,23 @@ pub struct FastRows<'a, const N: usize> {
     target_feature = "avx2",
     target_feature = "bmi2"
 ))]
-#[inline]
-fn extract(value: u128, mask: u128) -> u64 {
-    use std::arch::x86_64::_pext_u64;
-    // The build target provides BMI2, and mask has at most 32 set bits.
-    unsafe {
-        let result = _pext_u64(value as u64, mask as u64);
-        result
-            | (_pext_u64((value >> 64) as u64, (mask >> 64) as u64) << (mask as u64).count_ones())
-    }
-}
-
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx2",
-    target_feature = "bmi2"
-))]
-#[inline]
+#[inline(always)]
 fn fast_record<const N: usize>(line: &[u8], sep: u128, quotes: u128) -> Option<[&[u8]; N]> {
     if sep.count_ones() as usize != N {
         return None;
     }
-    let open_flags = if quotes == 0 {
-        0
-    } else {
-        let openings = (sep << 1) | 1;
-        let closings = sep >> 1;
-        // Each quote must be exclusively at the start or end of its field.
-        if quotes & !(openings ^ closings) != 0 {
-            return None;
-        }
-        // A carry from an opening quote runs through the field and stops at
-        // its separator. The marked separators must match the closing quotes.
-        let opened_ends = (!sep).wrapping_add(quotes & openings) & sep;
-        if opened_ends != (quotes & closings) << 1 {
-            return None;
-        }
-        extract(opened_ends, sep)
-    };
+    let openings = (sep << 1) | 1;
+    let closings = sep >> 1;
+    // Each quote must be exclusively at the start or end of its field.
+    if quotes & !(openings ^ closings) != 0 {
+        return None;
+    }
+    // A carry from an opening quote runs through the field and stops at
+    // its separator. The marked separators must match the closing quotes.
+    let opened_ends = (!sep).wrapping_add(quotes & openings) & sep;
+    if opened_ends != (quotes & closings) << 1 {
+        return None;
+    }
     if N == 7 {
         let low = sep as u64;
         let after_one = low & low.wrapping_sub(1);
@@ -167,7 +146,8 @@ fn fast_record<const N: usize>(line: &[u8], sep: u128, quotes: u128) -> Option<[
                         pos
                     }
                 };
-                let trim = ((open_flags >> index) & 1) as usize;
+                // The caller includes the terminating LF, so even the empty final field has a first byte.
+                let trim = usize::from(unsafe { *line.get_unchecked(previous) } == b'"');
                 // All offsets came from separators inside this row. Quoted
                 // fields passed the paired and exclusive boundary checks.
                 let slice = unsafe { line.get_unchecked(previous + trim..end - trim) };
@@ -180,7 +160,7 @@ fn fast_record<const N: usize>(line: &[u8], sep: u128, quotes: u128) -> Option<[
     let mut sep_hi = (sep >> 64) as u64;
     let mut previous = 0;
     let mut result = [&[][..]; N];
-    for (index, field) in result.iter_mut().enumerate() {
+    for field in result.iter_mut() {
         let end = if sep_lo != 0 {
             let end = sep_lo.trailing_zeros() as usize;
             sep_lo &= sep_lo - 1;
@@ -190,7 +170,7 @@ fn fast_record<const N: usize>(line: &[u8], sep: u128, quotes: u128) -> Option<[
             sep_hi &= sep_hi - 1;
             end
         };
-        let trim = (open_flags >> index) as usize & 1;
+        let trim = usize::from(unsafe { *line.get_unchecked(previous) } == b'"');
         // Each separator is in the row and a trimmed field has two distinct quotes.
         *field = unsafe { line.get_unchecked(previous + trim..end - trim) };
         previous = end + 1;
@@ -200,7 +180,7 @@ fn fast_record<const N: usize>(line: &[u8], sep: u128, quotes: u128) -> Option<[
 
 impl<'a, const N: usize> Iterator for FastRows<'a, N> {
     type Item = [&'a [u8]; N];
-    #[inline]
+    #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         while !self.data.is_empty() {
             let data = self.data;
@@ -234,7 +214,7 @@ impl<'a, const N: usize> Iterator for FastRows<'a, N> {
                 if len < 128 {
                     let mask = u128::MAX >> (127 - len);
                     self.data = &data[len + 1..];
-                    if let Some(row) = fast_record::<N>(&data[..len], sep & mask, quotes & mask) {
+                    if let Some(row) = fast_record::<N>(&data[..=len], sep & mask, quotes & mask) {
                         return Some(row);
                     }
                     continue;
@@ -252,7 +232,7 @@ impl<'a, const N: usize> Iterator for FastRows<'a, N> {
         None
     }
 }
-#[inline]
+#[inline(always)]
 fn eight_digits(digits: u64) -> i64 {
     let pairs = (digits.wrapping_mul(10) + (digits >> 8)) & 0x00ff_00ff_00ff_00ff;
     let quads = (pairs.wrapping_mul(100) + (pairs >> 16)) & 0x0000_ffff_0000_ffff;
@@ -354,8 +334,8 @@ impl TimestampParser {
         Self::default()
     }
 
-    #[inline]
-    fn midnight(&mut self, bytes: &[u8]) -> Option<i64> {
+    #[inline(always)]
+    fn midnight_seconds(&mut self, bytes: &[u8]) -> Option<i64> {
         let year_month = u64::from_le_bytes(bytes[..8].try_into().unwrap());
         let day_bytes = u16::from_le_bytes([bytes[8], bytes[9]]);
         // Modulo 32 this is 10 × the tens digit plus the units digit.
@@ -380,13 +360,13 @@ impl TimestampParser {
             *slot = CachedDate {
                 year_month,
                 day_bytes,
-                midnight: epoch_day(year, month, day) * DAY,
+                midnight: epoch_day(year, month, day) * 86_400,
             };
         }
         Some(slot.midnight)
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn timestamp(&mut self, bytes: &[u8]) -> Option<i64> {
         if !matches!(bytes.len(), 20 | 25) || bytes[4] != b'-' {
             return unsigned(bytes);
@@ -420,35 +400,66 @@ impl TimestampParser {
             }
             (hours * 60 + minutes) * if bytes[19] == b'+' { 60 } else { -60 }
         };
-        Some(self.midnight(bytes)? + (seconds - offset) * 1000)
+        Some((self.midnight_seconds(bytes)? + seconds - offset) * 1000)
     }
 
     /// The input contract guarantees that ingest_ts has valid UTC F1 syntax.
-    #[inline]
-    pub fn ingest(&mut self, bytes: &[u8]) -> i64 {
+    #[inline(always)]
+    pub fn ingest_seconds(&mut self, bytes: &[u8]) -> i64 {
         let bytes: &[u8; 20] = bytes.try_into().expect("ingest_ts must be valid F1");
-        self.midnight(bytes)
+        self.midnight_seconds(bytes)
             .expect("ingest_ts must have a calendar date")
             + clock_seconds::<false>(
                 u64::from_le_bytes(bytes[11..19].try_into().unwrap()) & 0x0f0f_000f_0f00_0f0f,
             )
             .unwrap()
-                * 1000
     }
 }
 
-#[inline]
+#[inline(always)]
 fn clock_seconds<const VALIDATE: bool>(clock: u64) -> Option<i64> {
-    // Each two-digit decimal pair occupies its own 24-bit lane.
-    const TENS: u64 = 0x000f_0000_0f00_000f;
-    let pairs = (clock & TENS) * 10 + ((clock >> 8) & TENS);
-    if VALIDATE && (pairs + 0x00c4_0000_c400_00e8) & 0x0100_0001_0000_0100 != 0 {
-        return None;
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "ssse3",
+        target_feature = "sse4.1"
+    ))]
+    {
+        use std::arch::x86_64::*;
+        // Convert HH, the minute tens, the minute units and SS together.
+        unsafe {
+            let components = _mm_maddubs_epi16(
+                _mm_cvtsi64_si128(clock as i64),
+                _mm_cvtsi64_si128(0x010a_0001_0a00_010a),
+            );
+            if VALIDATE {
+                let maxima = _mm_cvtsi64_si128(0x003b_0009_0032_0017);
+                let bad = _mm_cmpgt_epi16(components, maxima);
+                if _mm_testz_si128(bad, bad) == 0 {
+                    return None;
+                }
+            }
+            let weighted = _mm_madd_epi16(components, _mm_cvtsi64_si128(0x0001_003c_003c_0e10));
+            let total = _mm_add_epi32(weighted, _mm_srli_si128::<4>(weighted));
+            return Some(i64::from(_mm_cvtsi128_si32(total)));
+        }
     }
-    let hour = (pairs as u8) as i64;
-    let minute = ((pairs >> 24) as u8) as i64;
-    let second = (pairs >> 48) as i64;
-    Some(hour * 3600 + minute * 60 + second)
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "ssse3",
+        target_feature = "sse4.1"
+    )))]
+    {
+        // Each two-digit decimal pair occupies its own 24-bit lane.
+        const TENS: u64 = 0x000f_0000_0f00_000f;
+        let pairs = (clock & TENS) * 10 + ((clock >> 8) & TENS);
+        if VALIDATE && (pairs + 0x00c4_0000_c400_00e8) & 0x0100_0001_0000_0100 != 0 {
+            return None;
+        }
+        let hour = (pairs as u8) as i64;
+        let minute = ((pairs >> 24) as u8) as i64;
+        let second = (pairs >> 48) as i64;
+        Some(hour * 3600 + minute * 60 + second)
+    }
 }
 
 #[cfg(test)]
@@ -551,7 +562,7 @@ mod tests {
                 assert_eq!(parser.timestamp(text.as_bytes()), Some(n));
             }
         }
-        assert_eq!(parser.ingest(b"2000-02-29T01:02:03Z"), 951786123000);
+        assert_eq!(parser.ingest_seconds(b"2000-02-29T01:02:03Z"), 951786123);
         assert!(parser.timestamp(b"1900-02-29T01:02:03Z").is_none());
         assert_eq!(
             parser.timestamp(b"2000-02-29T01:02:03Z"),

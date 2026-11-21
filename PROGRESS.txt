@@ -5,10 +5,81 @@ Submission and targets
 [x] Implement the rules and publish the original solution, d6783e0.
     The team reported 8 seconds and rank 178.
 [x] Publish 36e2f49. The team reported 1.52 seconds on the practice portal.
-[x] Build and publish the next verified release on the same main branch.
+[x] Publish b45f23d. The team reported 1.17 seconds on the practice portal.
 [ ] Reach a 20M local container start-to-exit median below 1.000 second.
-    Best release median across the two warm seeds: 1.267 s.
-[ ] Obtain an official score for this release and reach <0.300 s on the portal.
+    Current 20M warm medians are 1.471, 1.514 and 1.440 s on this machine.
+[ ] Reach <0.300 s on the portal.
+
+Leaderboard research and next release
+[x] Read the track page. Scorer shopping-sessions-4 measures container start
+    to exit, with the median of three practice runs under 20 seconds. The
+    public board displayed team 67 at 0.36 s and Fraun at 0.64 s.
+[x] Compare public competitor code, benchmark independent implementations,
+    and verify the selected solver against both output tables.
+[x] Read Fraun's routing strategy, VibDiv's scored submissions and streaming
+    write benchmarks, and the session/click implementations by Js-Hwang1,
+    matthewf725 and zlyuan9. The public track page lists teams and times.
+    No first-place repository or commit could be independently confirmed.
+[x] Benchmark routing events to final shards during parsing. Waiting for links
+    increased the 20M pipeline median from 1.137 s to 1.477 s in that trial.
+[x] Implement and test a two-click shortcut, interval-based attribution,
+    aligned streaming stores, smaller event records, and SIMD clock decoding.
+    The 20M runs returned identical session and revenue totals. Full output
+    comparisons and interleaved container timings determine the release.
+
+[x] The selected build stores each chunk's common records contiguously, puts
+    overflow in per-shard buffers, and starts the largest alias/person groups
+    first. The SIMD parser keeps ingest time in seconds until needed.
+[x] Independently check SIMD calendar and clock decoding over all 3,652,059
+    supported dates, 1,000,000 two-digit clock triples, and 80,000 offset
+    cases. Compare CSV framing against the scalar parser on 200,000 mixed rows.
+[x] Compare every column and key on three 20M seeds and the 60M seed.
+    User/day rows matched: 2,224,281 / 2,230,619 / 2,250,629 / 6,648,247.
+    Campaign/day rows matched: 28,014 per input. Both CPU builds passed 11
+    unit tests and the official 1M answer. The image passed all 36 fixtures.
+[x] Compare a contiguous map for each entire phase. It cut dev minor faults
+    by 12–17% in two batches but lost to per-chunk storage at 20M on seed 73.
+[x] Benchmark the exact VibDiv submission 8527c64 on our machine. Median
+    local container durations were 1.358 s for b45f23d and 1.210 s for the
+    competitor that reports a 0.76 s official score. All output values agreed.
+
+20M release trials, old = b45f23d, restricted fresh Docker start to exit.
+Five trials per image on each warm seed, three per image on evicted input.
+Seed 2026
+  Old 2.527, 1.599, 1.775, 1.526, 1.596    median 1.599 s
+  New 1.863, 1.625, 1.471, 1.402, 1.437    median 1.471 s
+Seed 73
+  Old 2.213, 1.552, 1.587, 1.792, 1.479    median 1.587 s
+  New 1.807, 1.369, 1.476, 2.052, 1.514    median 1.514 s
+Held-out seed 271828
+  Old 4.191, 1.452, 1.686, 1.522, 1.696    median 1.686 s
+  New 1.884, 1.571, 1.414, 1.425, 1.440    median 1.440 s
+Seed 2026, Linux input cache evicted
+  Old 4.356, 3.389, 3.145    median 3.389 s
+  New 5.298, 3.482, 2.978    median 3.482 s
+
+Warm reductions were 8.1%, 4.6% and 14.6%. Applying the ratios to 1.17 s
+gives 1.08, 1.12 and 1.00 s on the portal. The evicted ratio gives 1.20 s.
+
+60M events + 15M clicks, seed 99, 6 GiB, paired fresh containers
+  Old 6.722, 4.816, 4.692    median 4.816 s
+  New 5.453, 4.883, 5.333    median 5.333 s
+  The new image measured 29,557,723 bytes. The benchmark and validation
+  files are in the task scratch directory.
+[x] Retest 60M with independently allocated shard buffers and input-order
+    scheduling. The medians in this batch were 5.686 s (old), 5.768 s
+    (selected release) and 5.684 s (alternative), three containers each.
+    Keep the verified practice configuration. Final-scale speedup is unproven.
+
+AVX-512 portal experiment
+[x] Build a separate x86-64-v4 + AES executable. The launcher checks CPU
+    capabilities and can also select the v3 or generic executable.
+[x] Run all 36 official fixtures and the 1M dev answer on the packaged v4
+    image under Intel SDE. Trace the launcher selecting shopping-v4. Verify
+    the native v3 fallback too. The optional image built locally in 203 s.
+[x] Publish the primary revision on main and the AVX-512 comparison revision
+    on perf/avx512. Keep all earlier submitted commits in repository history.
+[ ] Obtain a native AVX-512 portal time. Emulator timings cannot predict it.
 
 Bottleneck investigation and changes
 [x] Profile 36e2f49. One warm pipeline reached 0.423 s after event parsing

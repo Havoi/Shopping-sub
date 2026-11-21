@@ -16,6 +16,135 @@ struct Entry {
     ingest: u32,
 }
 
+// One allocation supplies the usual capacity of every destination in a
+// source chunk. A busy destination appends to its own spill vector; its
+// source indexes continue from the last primary row.
+struct ChunkRows<T: Copy> {
+    primary: Vec<std::mem::MaybeUninit<T>>,
+    width: usize,
+    counts: Vec<usize>,
+    spills: Vec<Vec<T>>,
+}
+
+impl<T: Copy> ChunkRows<T> {
+    fn new(groups: usize, estimated_per_group: usize) -> Self {
+        // An odd cache-line stride spreads equal positions in consecutive
+        // partitions across cache sets. Both stored record types are 16 bytes.
+        const {
+            assert!(std::mem::size_of::<T>() == 16);
+        }
+        let width = if estimated_per_group == 0 {
+            0
+        } else {
+            (estimated_per_group.div_ceil(4) | 1) * 4
+        };
+        let slots = width.checked_mul(groups).expect("too many rows in a chunk");
+        let mut primary = Vec::with_capacity(slots);
+        // Each shard initializes its prefix in insertion order before it is read.
+        primary.resize_with(slots, std::mem::MaybeUninit::uninit);
+        Self {
+            primary,
+            width,
+            counts: vec![0; groups],
+            spills: buckets(groups),
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, group: usize, row: T) -> usize {
+        let count = &mut self.counts[group];
+        let index = *count;
+        *count += 1;
+        if index < self.width {
+            // counts indexed the same group above and group * width < slots.
+            unsafe {
+                self.primary
+                    .get_unchecked_mut(group * self.width + index)
+                    .write(row);
+            }
+        } else {
+            self.spills[group].push(row);
+        }
+        index
+    }
+
+    fn take_shards(&mut self) -> Vec<Rows<'_, T>> {
+        let mut left = self.primary.as_mut_slice();
+        self.counts
+            .iter()
+            .zip(&mut self.spills)
+            .map(|(&count, spill)| {
+                let (section, rest) = std::mem::take(&mut left).split_at_mut(self.width);
+                left = rest;
+                let initialized = count.min(self.width);
+                // Only these initialized rows are exposed. split_at_mut proves
+                // the shard slices do not overlap before Rayon distributes them.
+                let head = unsafe {
+                    std::slice::from_raw_parts_mut(section.as_mut_ptr().cast::<T>(), initialized)
+                };
+                Rows {
+                    head,
+                    tail: std::mem::take(spill),
+                }
+            })
+            .collect()
+    }
+}
+
+struct Rows<'a, T> {
+    head: &'a mut [T],
+    tail: Vec<T>,
+}
+
+impl<T> Default for Rows<'_, T> {
+    fn default() -> Self {
+        Self {
+            head: &mut [],
+            tail: Vec::new(),
+        }
+    }
+}
+
+impl<T> Rows<'_, T> {
+    #[inline]
+    fn len(&self) -> usize {
+        self.head.len() + self.tail.len()
+    }
+
+    #[inline]
+    fn iter(&self) -> impl Iterator<Item = &T> {
+        self.head.iter().chain(&self.tail)
+    }
+
+    #[cfg(test)]
+    fn push(&mut self, row: T) {
+        self.tail.push(row)
+    }
+}
+
+impl<T> std::ops::Index<usize> for Rows<'_, T> {
+    type Output = T;
+    #[inline]
+    fn index(&self, index: usize) -> &T {
+        if index < self.head.len() {
+            &self.head[index]
+        } else {
+            &self.tail[index - self.head.len()]
+        }
+    }
+}
+
+impl<T> std::ops::IndexMut<usize> for Rows<'_, T> {
+    #[inline]
+    fn index_mut(&mut self, index: usize) -> &mut T {
+        if index < self.head.len() {
+            &mut self.head[index]
+        } else {
+            &mut self.tail[index - self.head.len()]
+        }
+    }
+}
+
 const ABSENT: u32 = u32::MAX;
 const LOCATION_BITS: usize = 8;
 const GROUP_MASK: usize = 127;
@@ -24,7 +153,7 @@ const EXTENDED_INGEST: u32 = u32::MAX;
 
 #[derive(Default)]
 struct IdPart<'a> {
-    entries: Vec<Entry>,
+    entries: Rows<'a, Entry>,
     extended: AHashMap<usize, i64>,
     general: Vec<(&'a [u8], i64, u32)>,
 }
@@ -49,15 +178,30 @@ struct Packed {
 }
 
 #[derive(Default)]
-struct PersonPart {
-    packed: Vec<Packed>,
+struct PersonPart<'a> {
+    packed: Rows<'a, Packed>,
     wide: Vec<PersonEvent>,
 }
 
-// Payload and ID parts retain source-chunk order, including empty parts.
+#[derive(Default)]
+struct IdDetails<'a> {
+    extended: AHashMap<usize, i64>,
+    general: Vec<(&'a [u8], i64, u32)>,
+}
+
+struct IdChunk<'a> {
+    rows: ChunkRows<Entry>,
+    details: Vec<IdDetails<'a>>,
+}
+
+struct PersonChunk {
+    rows: ChunkRows<Packed>,
+    wide: Vec<Vec<PersonEvent>>,
+}
+
 pub(crate) struct EventParts<'a> {
-    ids: Vec<Vec<IdPart<'a>>>,
-    people: Vec<Vec<PersonPart>>,
+    ids: Vec<IdChunk<'a>>,
+    people: Vec<PersonChunk>,
 }
 
 // With a shared leading byte, up to eight remaining bytes fit in one word.
@@ -89,25 +233,27 @@ fn alias_group(person: u64, groups: usize) -> usize {
 }
 
 #[inline]
-fn save_payload(parts: &mut [PersonPart], event: PersonEvent, context: &Context) -> u32 {
-    let group = alias_group(event.person, parts.len());
-    let part = &mut parts[group];
+fn save_payload(parts: &mut PersonChunk, event: PersonEvent, context: &Context) -> u32 {
+    let group = alias_group(event.person, parts.wide.len());
     let offset = event.ts - context.start;
     let index = if offset < i64::from(u32::MAX) && (event.revenue == 0 || event.category <= 255) {
-        let index = part.packed.len() << LOCATION_BITS;
-        part.packed.push(Packed {
-            person: event.person,
-            offset: offset as u32,
-            finance: if event.revenue == 0 {
-                0
-            } else {
-                (event.category << 24) | event.revenue
+        let index = parts.rows.push(
+            group,
+            Packed {
+                person: event.person,
+                offset: offset as u32,
+                finance: if event.revenue == 0 {
+                    0
+                } else {
+                    (event.category << 24) | event.revenue
+                },
             },
-        });
-        index
+        );
+        index << LOCATION_BITS
     } else {
-        let index = (part.wide.len() << LOCATION_BITS) | WIDE;
-        part.wide.push(event);
+        let bucket = &mut parts.wide[group];
+        let index = (bucket.len() << LOCATION_BITS) | WIDE;
+        bucket.push(event);
         index
     };
     // Inputs::chunks is at most 4 MiB plus one terminal line. Even the
@@ -128,24 +274,26 @@ pub(crate) fn scan_events<'a>(input: &'a Inputs, context: &Context) -> EventPart
         .par_iter()
         .map(|chunk| {
             let estimated = chunk.len() / 76;
-            let mut ids: Vec<_> = (0..context.event_shards)
-                .map(|_| IdPart {
-                    entries: Vec::with_capacity(estimated * 11 / 10 / context.event_shards),
-                    ..IdPart::default()
-                })
-                .collect();
-            let mut people: Vec<_> = (0..group_count)
-                .map(|_| PersonPart {
-                    packed: Vec::with_capacity(estimated * 11 / 10 / group_count),
-                    wide: Vec::new(),
-                })
-                .collect();
+            let mut ids = IdChunk {
+                rows: ChunkRows::new(
+                    context.event_shards,
+                    estimated * 11 / 10 / context.event_shards,
+                ),
+                details: (0..context.event_shards)
+                    .map(|_| IdDetails::default())
+                    .collect(),
+            };
+            let mut people = PersonChunk {
+                rows: ChunkRows::new(group_count, estimated * 11 / 10 / group_count),
+                wide: buckets(group_count),
+            };
             let mut dates = TimestampParser::new();
             for [id, user, ts, ingest, kind, product, price] in rows::<7>(chunk) {
                 if id.is_empty() {
                     continue;
                 }
-                let ingest = dates.ingest(ingest);
+                let seconds = dates.ingest_seconds(ingest);
+                let ingest = seconds * 1000;
                 let revenue = if kind == b"purchase" {
                     unsigned(price)
                         .filter(|value| (1..=10_000_000).contains(value))
@@ -179,37 +327,33 @@ pub(crate) fn scan_events<'a>(input: &'a Inputs, context: &Context) -> EventPart
                 };
                 let mask = context.event_shards - 1;
                 if let Some(key) = compact_key(id, prefix) {
-                    let part = &mut ids[key as usize & mask];
-                    let seconds = (ingest / 1000) as u64;
+                    let shard = key as usize & mask;
+                    let seconds = seconds as u64;
                     let ingest = if seconds < u64::from(EXTENDED_INGEST) {
                         seconds as u32
                     } else {
-                        part.extended.insert(part.entries.len(), ingest);
+                        ids.details[shard]
+                            .extended
+                            .insert(ids.rows.counts[shard], ingest);
                         EXTENDED_INGEST
                     };
-                    part.entries.push(Entry {
-                        key,
-                        location,
-                        ingest,
-                    });
+                    ids.rows.push(
+                        shard,
+                        Entry {
+                            key,
+                            location,
+                            ingest,
+                        },
+                    );
                 } else {
                     let shard = context.hash.hash_one(id) as usize & mask;
-                    ids[shard].general.push((id, ingest, location));
+                    ids.details[shard].general.push((id, ingest, location));
                 }
             }
             (ids, people)
         })
         .collect();
-    let mut ids = buckets(context.event_shards);
-    let mut people = buckets(group_count);
-    for (by_id, by_person) in chunks {
-        for (shard, part) in ids.iter_mut().zip(by_id) {
-            shard.push(part);
-        }
-        for (shard, part) in people.iter_mut().zip(by_person) {
-            shard.push(part);
-        }
-    }
+    let (ids, people) = chunks.into_iter().unzip();
     EventParts { ids, people }
 }
 
@@ -238,7 +382,7 @@ fn rejected(parts: Vec<IdPart<'_>>, groups: usize) -> Vec<Vec<u64>> {
     let mut seen = vec![0u64; bit_count / 64];
     let mut repeated = vec![0u64; seen.len()];
     for part in &parts {
-        for entry in &part.entries {
+        for entry in part.entries.iter() {
             let n = (entry.key >> 29) as usize & mask;
             let bit = 1u64 << (n & 63);
             repeated[n >> 6] |= seen[n >> 6] & bit;
@@ -372,7 +516,7 @@ fn resolve<T: GroupEvent>(
     for part in parts {
         let packed = part
             .packed
-            .into_iter()
+            .iter()
             .filter(|row| row.offset != u32::MAX)
             .map(|row| {
                 (
@@ -397,18 +541,58 @@ pub(crate) fn finish_events<T: GroupEvent>(
     raw: EventParts<'_>,
     context: &Context,
 ) -> Vec<Vec<Vec<KeyedEvent<T>>>> {
-    let groups = raw.people.len();
-    let losses = raw
-        .ids
+    let EventParts {
+        mut ids,
+        mut people,
+    } = raw;
+    let groups = context.event_shards.min(32);
+    let mut id_shards = buckets(context.event_shards);
+    for chunk in &mut ids {
+        let details = std::mem::take(&mut chunk.details);
+        for (shard, (entries, info)) in id_shards
+            .iter_mut()
+            .zip(chunk.rows.take_shards().into_iter().zip(details))
+        {
+            shard.push(IdPart {
+                entries,
+                extended: info.extended,
+                general: info.general,
+            });
+        }
+    }
+    let losses = id_shards
         .into_par_iter()
         .map(|parts| rejected(parts, groups))
         .collect();
+    drop(ids);
     let losses = transpose(losses, groups);
-    let result = raw
-        .people
-        .into_par_iter()
+    let mut people_shards = buckets(groups);
+    for chunk in &mut people {
+        let wide = std::mem::take(&mut chunk.wide);
+        for (shard, (packed, wide)) in people_shards
+            .iter_mut()
+            .zip(chunk.rows.take_shards().into_iter().zip(wide))
+        {
+            shard.push(PersonPart { packed, wide });
+        }
+    }
+    // Distribute the largest alias groups before workers take smaller ones.
+    let mut jobs: Vec<_> = people_shards
+        .into_iter()
         .zip(losses)
-        .map(|(parts, losses)| resolve::<T>(parts, losses, context))
+        .map(|(parts, losses)| {
+            let count = parts
+                .iter()
+                .map(|part| part.packed.len() + part.wide.len())
+                .sum::<usize>();
+            (count, parts, losses)
+        })
+        .collect();
+    jobs.sort_unstable_by_key(|job| std::cmp::Reverse(job.0));
+    let result = jobs
+        .into_iter()
+        .par_bridge()
+        .map(|(_, parts, losses)| resolve::<T>(parts, losses, context))
         .collect();
     transpose(result, context.person_shards)
 }
@@ -481,6 +665,28 @@ mod tests {
         assert!(!keys.contains(&0));
         for id in [&b"e"[..], b"e1\0", b"x1234", b"e123456789"] {
             assert!(compact_key(id, b'e').is_none());
+        }
+    }
+
+    #[test]
+    fn primary_ranges_and_spills_preserve_every_logical_position() {
+        for initial in [0, 1, 5, 16] {
+            let mut storage = ChunkRows::new(4, initial);
+            let mut expected = vec![vec![]; 4];
+            for i in 0..95u64 {
+                let group = (i * i % 3) as usize;
+                let row = [i, !i];
+                assert_eq!(storage.push(group, row), expected[group].len());
+                expected[group].push(row);
+            }
+            for (mut rows, values) in storage.take_shards().into_iter().zip(expected) {
+                assert!(rows.iter().copied().eq(values.iter().copied()));
+                for (index, value) in values.into_iter().enumerate() {
+                    assert_eq!(rows[index], value);
+                    rows[index][0] += 1;
+                    assert_eq!(rows[index][0], value[0] + 1);
+                }
+            }
         }
     }
 

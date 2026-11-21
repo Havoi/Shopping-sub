@@ -68,15 +68,80 @@ python3 scripts/compare.py /path/to/output42 /path/to/expected42
 CSV, timestamp, identity and compact-record unit checks are available with `make test` when Rust 1.85 or later is
 installed. `Cargo.lock` pins the dependency graph used by the Docker build.
 
-## Local measurements
+## Current release benchmark
+
+The team scored **1.17 s on the portal** with `b45f23d`. Each number below
+is a median of fresh, restricted containers on the Ryzen 5 5600H, pinned to
+eight hardware threads across four cores with 6 GiB and no swap. We alternated
+images on identical files and measured Docker start to exit. We read the
+files before each warm series. Seed 271828 was held out of implementation
+and configuration selection.
+
+| Practice input (20M events + 5M clicks) | Runs per image | `b45f23d` | Current | Reduction |
+|---|---:|---:|---:|---:|
+| Warm, seed 2026 | 5 | 1.599 s | **1.471 s** | 8.1% |
+| Warm, seed 73 | 5 | 1.587 s | **1.514 s** | 4.6% |
+| Warm, new seed 271828 | 5 | 1.686 s | **1.440 s** | 14.6% |
+| Linux input cache evicted, seed 2026 | 3 | 3.389 s | 3.482 s | -2.7% |
+
+Scaling our measured warm ratios by our own 1.17 s score projects roughly
+**1.08 s** on the portal, with seed-specific projections of 1.00–1.12 s.
+The cache-evicted comparison gives 1.20 s. The organizers report practice
+variation of up to about 20% across scoring machines. An official run is
+needed to establish the new score. [Scoring rules](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions)
+
+The parser validates all quotes with bit masks, reads each field's opening
+byte for trimming, and decodes hours, minutes and seconds in parallel SIMD
+lanes on supported CPUs. Ingestion timestamps stay in whole seconds for
+duplicate comparisons. Event IDs and payloads use separate contiguous
+buffers per source chunk, with an overflow vector for any partition that
+exceeds its estimated capacity. The next two stages schedule the largest
+groups first to reduce the time workers spend waiting for the last group.
+
+The first paired final-size trial (60M events, 15M clicks, seed 99) had a
+median of **5.333 s** for this build and **4.816 s** for `b45f23d`. Each
+image ran three times with 6 GiB. A second paired batch measured 5.768 s
+for this release and 5.686 s for the old one. A 60M speedup on this laptop
+remains unverified. The competition provides 24 GB. Both output
+tables matched on all three practice inputs and the final-size input,
+including all 6,648,247 user/day rows at final size. The container passed
+all 36 public fixtures, and both CPU builds matched the public 1M answer.
+
+The optional AVX-512 branch adds a third executable selected by the launcher.
+Under Intel SDE, the packaged image selected that executable, passed the
+36 fixtures and reproduced the 1M answer. Native AVX-512 performance remains
+unmeasured. [AVX-512 comparison branch](https://github.com/Havoi/Shopping-sub/tree/perf/avx512)
+
+## Public implementations compared
+
+The November 21 public practice board showed team 67 at 0.36 s, Fraun at
+0.64 s and VibDiv at 0.76 s. The board publishes team names and scores.
+We could verify repository matches for Fraun and VibDiv. The source behind
+the 0.36 s entry remains unconfirmed. [Track and standings](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions)
+
+* Fraun routes raw user IDs to keep identity lookups close together in memory.
+  We tested resolving identities during parsing and routing straight to the
+  final worker. Waiting for all links first slowed our pipeline on the 20M
+  input. [Fraun's strategy](https://github.com/Jerryh127/fraun-shopping-sessions/blob/7044ee91c989222b2003204501a2e98d9b49a02d/STRATEGY.md)
+* VibDiv measured the effect of buffering records until they fill a cache
+  line. We independently implemented this and compared it with contiguous
+  per-chunk storage. We also rebuilt their scored commit, `8527c64`. It took
+  a median 1.210 s on our machine. Our submitted `b45f23d` took 1.358 s
+  in the same trial. All 2,224,281 user/day rows and 28,014 campaign/day rows
+  agreed after widening two integer columns. [VibDiv's benchmarks](https://github.com/Vibhor7-7/shopping-sessions/blob/738e1a02f65cb66bf8d0cc365a2a172d229dc47e/BENCH.md) · [Scored commits](https://github.com/Vibhor7-7/shopping-sessions/blob/738e1a02f65cb66bf8d0cc365a2a172d229dc47e/SUBMISSIONS.md)
+* Other public implementations use direct attribution for people with very
+  few clicks, map each click to a contiguous range of sessions, or start
+  the largest person buckets first. We tested all three ideas. [Small click lists](https://github.com/Js-Hwang1/buildathon_databricks/blob/fc2965e0563653dee747beac45f65eca6b336b19/src/engine.cpp) · [Session ranges](https://github.com/matthewf725/shopping-sessions/blob/ef41f89be7e70a37fa26801b45bb36517ced994c/src/sessions.hpp) · [Bucket scheduling](https://github.com/zlyuan9/shopping-sessions/blob/cf574646a148bfa8d894fa8ae0f2aae1fefe7018/src/main.rs)
+
+## Local measurements for the 1.17 s submission
 
 The team reports **1.52 s on the portal** for commit `36e2f49` and 8 s
 for its predecessor `d6783e0`. The comparisons below use `36e2f49` and
-this release on a Ryzen 5 5600H. Each sample is a fresh container with eight
+`b45f23d` on a Ryzen 5 5600H. Each sample is a fresh container with eight
 pinned hardware threads on four cores, 6 GiB, no swap, read-only input and
 no network. Durations come from Docker's start and exit timestamps.
 
-| 20M events + 5M clicks | Runs per image | 1.52 s submission | This release |
+| 20M events + 5M clicks | Runs per image | 1.52 s submission | 1.17 s submission |
 |---|---:|---:|---:|
 | Seed 2026, warm Linux input | 5 | 1.985 s | **1.275 s** |
 | Seed 73, warm Linux input | 3 | 1.972 s | **1.267 s** |
@@ -90,8 +155,7 @@ took 1.189 s from start to exit and 0.996 s inside the executable.
 
 Applying the warm runtime ratios to the team's 1.52 s portal score gives
 **about 0.98 s** on either seed. The cache-evicted ratio gives 1.36 s.
-The new portal score and rank require a submission. The measured local
-median exceeds the 1.000 s target, and a 0.300 s portal score remains open.
+The team's subsequent official result for `b45f23d` was **1.17 s**.
 
 On final-size seed 99 (60M events and 15M clicks), three optimized
 containers took 12.070, 9.587, 5.450 s. The median was **9.587 s**.

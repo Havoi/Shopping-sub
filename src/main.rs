@@ -712,12 +712,23 @@ fn aggregate_clicks<T: GroupEvent, C: ClickTime>(
         "deduplication and clicks {:.3}s",
         started.elapsed().as_secs_f64()
     );
-    let totals = events_by_person
-        .into_par_iter()
+    // Start the largest shards first. A few shoppers can account for a
+    // substantial fraction of the input, and their records share a shard.
+    let mut jobs: Vec<_> = events_by_person
+        .into_iter()
         .zip(clicks_by_person)
         .enumerate()
         .map(|(shard, (events, clicks))| {
-            let count = events.iter().map(Vec::len).sum();
+            let count = events.iter().map(Vec::len).sum::<usize>();
+            let work = count + clicks.iter().map(Vec::len).sum::<usize>();
+            (work, shard, count, events, clicks)
+        })
+        .collect();
+    jobs.sort_unstable_by_key(|job| std::cmp::Reverse(job.0));
+    let totals = jobs
+        .into_iter()
+        .par_bridge()
+        .map(|(_, shard, count, events, clicks)| {
             group_people::<T, C>(events, clicks, shard, context, count)
         })
         .try_reduce_with(|left, right| Ok(left.merge(right)))
