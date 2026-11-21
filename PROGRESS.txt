@@ -1,0 +1,92 @@
+Shopping Sessions challenge progress
+Updated 2026-11-21, Asia/Kolkata
+
+[x] Read rules.md, the competition brief, and starter scripts.
+[x] Configure Linux testing through WSL and Docker on D:.
+[x] Extract the 36 official fixtures and comparison scripts.
+[x] Build the official generator and generate the public development data.
+[x] Implement the complete pipeline in Rust.
+[x] Pass all 3 unit checks.
+[x] Pass all 36 official fixtures with the final Docker image.
+[x] Match both official million-event answer tables exactly.
+[x] Match an independent reference on 3 additional seeds.
+[x] Match an adversarial case with a 1,000-link identity chain.
+[x] Build and test the image with scorer filesystem and network restrictions.
+[x] Benchmark 20M events and 5M clicks.
+[x] Diagnose and fix final-scale performance under memory pressure.
+[x] Complete 60M events and 15M clicks within the local 180-second cap.
+[x] Validate schemas, unique keys, and aggregate consistency at large scale.
+[x] Add reproducible commands and an implementation walkthrough.
+[x] Check image and submission source sizes.
+[x] Initialize the local Git repository with generated data excluded.
+[x] Finish the verification summary and record remaining limitations.
+[ ] Publish a public GitHub repository and submit a commit to the scorer.
+
+Current status
+Local implementation and verification are complete. Public publication and
+competition scoring are pending a repository destination and submission.
+
+Final-image benchmarks
+20M events and 5M clicks, seed 2026
+  Total Docker CLI wall time       13.93 seconds
+  Pipeline time                    12.484 seconds
+  Peak container memory            3887398912 bytes, about 3.62 GiB
+
+60M events and 15M clicks, seed 99
+  Total Docker CLI wall time       54.82 seconds
+  Pipeline time                    52.293 seconds
+  Peak container memory            6442450944 bytes, 6 GiB
+
+Both used 8 pinned CPU threads, a 6 GiB container memory limit, no swap,
+uid 1000, read-only root and inputs, and disabled networking. The scorer
+provides 24 GiB. Local laptop timings do not establish hidden scorer times.
+
+Correctness verification
+The final image passed all 36 supplied fixtures through its normal entry
+point with the supplied Docker runner. Both public answer tables matched
+exactly, with zero missing rows, extra rows, differences, or duplicate keys.
+The public result has 117038 user/day rows and 27400 campaign/day rows.
+
+An independent Python implementation matched seeds 2, 17, and 42 at
+30K events and 10K clicks each. An additional adversarial dataset covered
+a long identity chain, an unused canonical ID, leap-day and midnight
+sessions, invalid early duplicates, malformed quoting, CR bytes, and ties.
+
+The final-scale result has 6648247 user/day rows and 28014 campaign/day
+rows. Both tables total 10055848 sessions and 19223422711 revenue cents.
+Schema, unique-key, purchasing-session, and attribution-total checks passed.
+Large generated datasets have no supplied golden answers. Their checks
+complement the exact comparisons on the public and independent datasets.
+
+Implementation
+Strict CSV and timestamp parsing.
+Union-find identity resolution followed by integer person IDs.
+Global event-ID deduplication before invalid or late records are removed.
+Full short event IDs stored inline, with full borrowed values for long IDs.
+Time-ordered session scans and seven-day campaign attribution windows.
+Explicit Parquet schemas, DATE columns, and nullable top categories.
+
+Performance work
+Two early 60M runs timed out during deduplication at the local 6 GiB limit.
+Integer person IDs reduced sorting costs. Storing short event IDs inline
+removed scattered CSV reads during duplicate comparisons. Deduplication
+then took about 3.4 seconds at final scale. The compact binary first
+completed in 56.77 seconds, followed by the final-image run in 54.82 seconds.
+
+Generation and packaging
+The 60M input was generated with a scratch copy of the official generator
+that writes shards incrementally to fit local RAM. Its seed-1 output
+matched all 87 original-generator files byte for byte before use.
+Input generation is outside the timed pipeline runs.
+The final Docker image is 28808658 bytes, about 27.5 MiB.
+Submission source and small fixtures are under 1 MB before Git metadata.
+Fixture bytes are protected from Git newline conversion.
+
+Workspace
+D:\Sem2\Sem 5\Buildathon\Shopping-Databrics
+
+Generated datasets, downloads, outputs, and build cache
+D:\ChatGPT-Codex\tmp\shopping-sessions
+
+Task action log
+D:\ChatGPT-Codex\logs\agent-actions.jsonl
