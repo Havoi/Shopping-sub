@@ -490,13 +490,55 @@ impl BinScratch {
     }
 }
 
+/// A worker owns one complete set of buffers while it drains person shards.
+/// Every grouped event and click slot is overwritten before being read.
+struct PersonWorker<T, C> {
+    grouped_events: Vec<T>,
+    grouped_clicks: Vec<Ad<C>>,
+    ranges: Vec<PersonRange>,
+    overflow: AHashMap<u64, usize>,
+    rows: Vec<UserDay>,
+    categories: Vec<i64>,
+    attribution: Attribution,
+    bins: BinScratch,
+    totals: DailyCampaigns,
+}
+
+impl<T, C> PersonWorker<T, C> {
+    fn new(context: &Context) -> Self {
+        Self {
+            grouped_events: Vec::new(),
+            grouped_clicks: Vec::new(),
+            ranges: Vec::new(),
+            overflow: AHashMap::new(),
+            rows: Vec::new(),
+            categories: vec![0; context.dimensions.categories.len()],
+            attribution: Attribution::new(context.dimensions.campaign_names.len()),
+            bins: BinScratch::default(),
+            totals: DailyCampaigns::new(context),
+        }
+    }
+}
+
 fn group_people<T: GroupEvent, C: ClickTime>(
     mut events: Vec<Vec<KeyedEvent<T>>>,
     mut clicks: Vec<Vec<KeyedClick<C>>>,
     shard: usize,
     context: &Context,
     count: usize,
-) -> Result<DailyCampaigns> {
+    worker: &mut PersonWorker<T, C>,
+) -> Result<()> {
+    let PersonWorker {
+        grouped_events,
+        grouped_clicks,
+        ranges,
+        overflow,
+        rows,
+        categories,
+        attribution,
+        bins,
+        totals,
+    } = worker;
     // The usual case needs only one cache-line probe for both identity and
     // counts. A separate overflow map keeps the probe bound fixed even for a
     // shard in which every event has a different person.
@@ -507,8 +549,9 @@ fn group_people<T: GroupEvent, C: ClickTime>(
         let bits = mix_key(person);
         (bits >> shift) as usize
     };
-    let mut ranges = vec![PersonRange::default(); slots];
-    let mut overflow = AHashMap::new();
+    ranges.clear();
+    ranges.resize(slots, PersonRange::default());
+    overflow.clear();
     for row in events.iter_mut().flatten() {
         let first = first_slot(row.person);
         let mut found = None;
@@ -564,10 +607,9 @@ fn group_people<T: GroupEvent, C: ClickTime>(
             row.person = u64::MAX;
         }
     }
-    drop(overflow);
     let mut event_count = 0;
     let mut click_count = 0;
-    for range in &mut ranges {
+    for range in ranges.iter_mut() {
         let next_event = event_count + range.event_end;
         let next_click = click_count + range.click_end;
         range.event_end = event_count;
@@ -576,13 +618,17 @@ fn group_people<T: GroupEvent, C: ClickTime>(
         click_count = next_click;
     }
 
-    let mut grouped_events = vec![T::default(); event_count];
+    if grouped_events.len() < event_count {
+        grouped_events.resize(event_count, T::default());
+    }
     for row in events.into_iter().flatten() {
         let cursor = &mut ranges[row.person as usize].event_end;
         grouped_events[*cursor] = row.data;
         *cursor += 1;
     }
-    let mut grouped_clicks = vec![Ad::default(); click_count];
+    if grouped_clicks.len() < click_count {
+        grouped_clicks.resize(click_count, Ad::default());
+    }
     for row in clicks.into_iter().flatten() {
         if row.person != u64::MAX {
             let cursor = &mut ranges[row.person as usize].click_end;
@@ -590,21 +636,18 @@ fn group_people<T: GroupEvent, C: ClickTime>(
             *cursor += 1;
         }
     }
-    let mut rows = Vec::with_capacity(event_count / 10);
-    let mut totals = DailyCampaigns::new(context);
-    let mut categories = vec![0i64; context.dimensions.categories.len()];
-    let mut attribution = Attribution::new(context.dimensions.campaign_names.len());
+    rows.clear();
+    rows.reserve(event_count / 10);
 
     let mut event_begin = 0;
     let mut click_begin = 0;
-    let mut bins = BinScratch::default();
     let bin_count = context
         .end
         .abs_diff(context.start)
         .div_ceil(SESSION_GAP as u64);
     let bin_count = usize::try_from(bin_count).unwrap_or(usize::MAX);
     let use_bins = bin_count.saturating_mul(categories.len().max(1)) <= 131_072;
-    for range in ranges {
+    for range in ranges.drain(..) {
         if range.event_end == event_begin {
             continue;
         }
@@ -624,10 +667,10 @@ fn group_people<T: GroupEvent, C: ClickTime>(
                 person_clicks,
                 context,
                 bin_count,
-                &mut attribution,
-                &mut totals,
-                &mut rows,
-                &mut categories,
+                attribution,
+                totals,
+                rows,
+                categories,
             );
             continue;
         }
@@ -646,7 +689,7 @@ fn group_people<T: GroupEvent, C: ClickTime>(
                 at += 1;
             }
             if current.as_ref().is_some_and(|row| row.day != day) {
-                finish_day(&mut rows, current.take().unwrap(), &mut categories);
+                finish_day(rows, current.take().unwrap(), categories);
             }
             let row = current.get_or_insert(UserDay {
                 person,
@@ -670,7 +713,7 @@ fn group_people<T: GroupEvent, C: ClickTime>(
             totals.record(day, campaign, revenue, &attribution.active);
         }
         if let Some(row) = current {
-            finish_day(&mut rows, row, &mut categories);
+            finish_day(rows, row, categories);
         }
     }
     output::users(
@@ -678,11 +721,11 @@ fn group_people<T: GroupEvent, C: ClickTime>(
             .output
             .join("user_daily")
             .join(format!("part-{shard:03}.parquet")),
-        &rows,
+        rows,
         &context.people,
         &context.dimensions,
     )?;
-    Ok(totals)
+    Ok(())
 }
 
 fn aggregate<T: GroupEvent>(
@@ -725,11 +768,21 @@ fn aggregate_clicks<T: GroupEvent, C: ClickTime>(
         })
         .collect();
     jobs.sort_unstable_by_key(|job| std::cmp::Reverse(job.0));
-    let totals = jobs
-        .into_iter()
-        .par_bridge()
-        .map(|(_, shard, count, events, clicks)| {
-            group_people::<T, C>(events, clicks, shard, context, count)
+    let worker_count = jobs.len().min(rayon::current_num_threads());
+    let queue = std::sync::Mutex::new(jobs.into_iter());
+    let totals = (0..worker_count)
+        .into_par_iter()
+        .with_max_len(1)
+        .map(|_| -> Result<DailyCampaigns> {
+            let mut worker = PersonWorker::new(context);
+            loop {
+                let job = queue.lock().expect("person shard queue poisoned").next();
+                let Some((_, shard, count, events, clicks)) = job else {
+                    break;
+                };
+                group_people(events, clicks, shard, context, count, &mut worker)?;
+            }
+            Ok(worker.totals)
         })
         .try_reduce_with(|left, right| Ok(left.merge(right)))
         .expect("at least one person shard")?

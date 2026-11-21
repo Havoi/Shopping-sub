@@ -11,7 +11,7 @@ Submission and targets
     This saves 30 ms (2.8%). Reaching 0.500 s requires another 550 ms,
     or a 2.10x speedup from this result.
 [ ] Reach a 20M local container start-to-exit median below 1.000 second.
-    Current 20M warm medians are 1.471, 1.514 and 1.440 s on this machine.
+    The 1.08 s submission had local warm medians of 1.471, 1.514 and 1.440 s.
 [ ] Beat 0.500 s on the next portal submission. Longer-term target: 0.300 s.
 
 Critical-path measurements from b86512b
@@ -43,6 +43,24 @@ Critical-path measurements from b86512b
     scored 9a8f5a0 and 1.243 s for b86512b. All 2,230,398 user/day and
     28,014 campaign/day rows match. The local ratio scaled to 1.08 s gives
     1.03 s. Reaching 0.500 s would require a 53.7% reduction from 1.08 s.
+
+Worker reuse verification
+[x] Reuse event, click and campaign buffers across person shards and add a
+    compact index that can skip identity lookups for keys without redirects.
+[x] Compare the combined changes with the previous release in fresh containers.
+    Seed 2026 medians were 1.306 and 1.522 s. Seed 271828 medians were
+    1.275 and 1.497 s. Each build ran three times after a discarded warmup.
+[x] Repeat with the packaged release and five fresh runs per image per seed.
+    Previous/new medians: 1.423/1.454 s (2026), 1.208/1.214 s (73), and
+    1.463/1.433 s (271828). The larger practice gain did not repeat. Some
+    runs shared the laptop with compilation or correctness checks.
+[x] Run three fresh containers per image with 60M events and 15M clicks.
+    Previous: 8.373, 7.536, 5.710 s. New: 19.591, 6.243, 5.844 s.
+    The median fell 17% in this 6 GiB test. The slowest run increased.
+[x] Match both tables, all keys and all columns on all four large inputs.
+    The 60M result contains 6,648,247 user/day and 28,014 campaign/day rows.
+    All 36 official fixtures and 13 reference datasets passed. Both CPU
+    builds passed 12 unit tests and matched the official dev answer.
 
 Release verification
 [x] Benchmark routing events to final shards during parsing. Waiting for links

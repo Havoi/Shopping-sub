@@ -126,12 +126,20 @@ struct Slot {
 // Keys and values occupy the same cache line on a successful lookup.
 // Linear probing also fetches neighbouring candidates on collisions.
 struct AliasTable {
+    // Four fingerprint bits per hash bucket. A clear bit proves that this
+    // key is already canonical. A set bit still requires an exact lookup.
+    redirected: Vec<u64>,
     slots: Vec<Slot>,
     shift: u32,
     len: usize,
 }
 
 impl AliasTable {
+    #[inline]
+    fn redirect_bit(&self, key: u64) -> usize {
+        (crate::mix_key(key) >> (self.shift - 2)) as usize
+    }
+
     #[inline]
     fn bucket(&self, key: u64) -> usize {
         let mixed = crate::mix_key(key);
@@ -153,6 +161,10 @@ impl AliasTable {
 
     #[inline]
     fn get(&self, key: u64) -> u64 {
+        let tag = self.redirect_bit(key);
+        if self.redirected[tag >> 6] & (1u64 << (tag & 63)) == 0 {
+            return key;
+        }
         let slot = self.slots[self.position(key)];
         if slot.key == key {
             slot.value
@@ -233,6 +245,7 @@ impl People {
         // while parent links refer to its slot indices.
         let capacity = (count * 2 + count / 2 + 8).next_power_of_two();
         let mut aliases = AliasTable {
+            redirected: vec![0; (capacity / 16).max(1)],
             slots: vec![
                 Slot {
                     key: VACANT,
@@ -278,7 +291,13 @@ impl People {
         for i in 0..capacity {
             if aliases.slots[i].key != VACANT {
                 let root = aliases.slots[i].value as usize;
-                aliases.slots[i].value = aliases.slots[root].key;
+                let key = aliases.slots[i].key;
+                let canonical = aliases.slots[root].key;
+                aliases.slots[i].value = canonical;
+                if key != canonical {
+                    let tag = aliases.redirect_bit(key);
+                    aliases.redirected[tag >> 6] |= 1u64 << (tag & 63);
+                }
             }
         }
         assert!(self.aliases.set(aliases).is_ok(), "links already loaded");
@@ -451,6 +470,34 @@ impl Dimensions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redirect_fingerprint_collision_still_checks_the_key() {
+        let mut aliases = AliasTable {
+            slots: vec![
+                Slot {
+                    key: VACANT,
+                    value: 0
+                };
+                16
+            ],
+            redirected: vec![0],
+            len: 0,
+            shift: 60,
+        };
+        let raw = 9;
+        let canonical = 3;
+        let index = aliases.vertex(raw);
+        aliases.slots[index].value = canonical;
+        let bit = aliases.redirect_bit(raw);
+        aliases.redirected[0] |= 1 << bit;
+        let collision = (raw + 1..)
+            .find(|&key| aliases.redirect_bit(key) == bit)
+            .unwrap();
+        assert_eq!(aliases.get(raw), canonical);
+        assert_eq!(aliases.get(collision), collision);
+        assert_eq!(aliases.get(canonical), canonical);
+    }
     use std::collections::HashSet;
 
     #[test]
