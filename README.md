@@ -68,27 +68,32 @@ python3 scripts/compare.py /path/to/output42 /path/to/expected42
 CSV, timestamp, identity and compact-record unit checks are available with `make test` when Rust 1.85 or later is
 installed. `Cargo.lock` pins the dependency graph used by the Docker build.
 
-## Current release benchmark
+## Worker memory reuse
 
-The team scored **1.17 s on the portal** with `b45f23d`. Each number below
+Each worker reuses its event, click and campaign buffers across person shards.
+A compact index lets users with no possible identity redirect skip a hash-table
+lookup. The packaged build matched both complete output tables at 20M and 60M.
+In a five-run practice comparison, the three local medians stayed within 2.3%
+of the preceding release. For 60M events and 15M clicks, the local median was
+6.243 s over three runs with 6 GiB. See [PROGRESS.txt](PROGRESS.txt) for the
+individual final-size times and test coverage.
+
+## Benchmarks for the 1.08 s submission
+
+The team scored **1.08 s on the portal** with `9a8f5a0` and **1.17 s** with
+`b45f23d`. Each number below
 is a median of fresh, restricted containers on the Ryzen 5 5600H, pinned to
 eight hardware threads across four cores with 6 GiB and no swap. We alternated
 images on identical files and measured Docker start to exit. We read the
 files before each warm series. Seed 271828 was held out of implementation
 and configuration selection.
 
-| Practice input (20M events + 5M clicks) | Runs per image | `b45f23d` | Current | Reduction |
+| Practice input (20M events + 5M clicks) | Runs per image | `b45f23d` | `9a8f5a0` | Reduction |
 |---|---:|---:|---:|---:|
 | Warm, seed 2026 | 5 | 1.599 s | **1.471 s** | 8.1% |
 | Warm, seed 73 | 5 | 1.587 s | **1.514 s** | 4.6% |
 | Warm, new seed 271828 | 5 | 1.686 s | **1.440 s** | 14.6% |
 | Linux input cache evicted, seed 2026 | 3 | 3.389 s | 3.482 s | -2.7% |
-
-Scaling our measured warm ratios by our own 1.17 s score projects roughly
-**1.08 s** on the portal, with seed-specific projections of 1.00–1.12 s.
-The cache-evicted comparison gives 1.20 s. The organizers report practice
-variation of up to about 20% across scoring machines. An official run is
-needed to establish the new score. [Scoring rules](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions)
 
 The parser validates all quotes with bit masks, reads each field's opening
 byte for trimming, and decodes hours, minutes and seconds in parallel SIMD
