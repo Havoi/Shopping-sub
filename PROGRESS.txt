@@ -10,6 +10,9 @@ Submission and targets
 [x] Submit b86512b. The team reported 1.05 seconds on the practice portal.
     This saves 30 ms (2.8%). Reaching 0.500 s requires another 550 ms,
     or a 2.10x speedup from this result.
+[x] Submit 0746b3d. The team reported 1.05 seconds on the practice portal.
+[ ] Measure bba2a13 on the portal against 0746b3d. The trial caps CPU
+    selection at x86-64-v3 and uses the same solver source as the control.
 [ ] Reach a 20M local container start-to-exit median below 1.000 second.
     The 1.08 s submission had local warm medians of 1.471, 1.514 and 1.440 s.
 [ ] Beat 0.500 s on the next portal submission. Longer-term target: 0.300 s.
@@ -38,7 +41,12 @@ Submission candidate with fused event parsing and a smaller identity table
 [x] Compare both full output tables on all four timed inputs. The new seed
     had 2,229,959 user/day rows and 28,014 campaign/day rows. The 60M input
     had 6,648,247 and 28,014 rows. All columns and grouping keys matched.
-[x] Publish this implementation on main. The portal score is pending.
+[x] Publish this implementation on main as 0746b3d. Practice score 1.05 s.
+
+CPU dispatch comparison
+[x] Publish bba2a13 on perf/portal-v3. All three packaged solver binaries
+    match 0746b3d by SHA-256. Both output tables matched on 49 native
+    datasets and 39 emulated runs, including three CPU selection checks.
 
 Critical-path measurements from b86512b
 [x] Time two 20M inputs with 5M clicks, four interleaved warm containers
