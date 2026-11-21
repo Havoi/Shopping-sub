@@ -1,0 +1,74 @@
+name: Runtime comparison
+on:
+  push:
+    branches: [validation/runtime-compare]
+permissions:
+  contents: read
+jobs:
+  comparison:
+    if: github.repository == 'Havoi/Shopping-sub' && github.event.repository.private == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    strategy:
+      fail-fast: false
+      matrix:
+        replica: [0, 1, 2]
+    env:
+      REPLICA: ${{ matrix.replica }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Inspect allocated CPU and memory
+        id: cpu
+        run: |
+          export RESULT_DIR="$RUNNER_TEMP/numeric-results"
+          echo "RESULT_DIR=$RESULT_DIR" >> "$GITHUB_ENV"
+          if ! python3 .github/scripts/runtime_probe.py >/dev/null 2>&1; then
+            echo "::error::CPU qualification failed."
+            exit 1
+          fi
+      - name: Prepare contexts
+        if: steps.cpu.outputs.measure == 'true'
+        env:
+          SHOPPING_R13_DELTA: ${{ secrets.SHOPPING_R13_DELTA }}
+          SHOPPING_R13_DELTA_2: ${{ secrets.SHOPPING_R13_DELTA_2 }}
+          SHOPPING_R13_DELTA_3: ${{ secrets.SHOPPING_R13_DELTA_3 }}
+          SHOPPING_R13_DELTA_4: ${{ secrets.SHOPPING_R13_DELTA_4 }}
+        run: |
+          umask 077
+          if ! python3 .github/scripts/materialize.py >/dev/null 2>&1; then
+            echo "::error::Input preparation failed."
+            exit 1
+          fi
+      - name: Install result reader
+        if: steps.cpu.outputs.measure == 'true'
+        run: |
+          python3 -m venv "$RUNNER_TEMP/solver-venv"
+          "$RUNNER_TEMP/solver-venv/bin/pip" --disable-pip-version-check --no-cache-dir --retries 2 install duckdb==1.5.6
+      - name: Compare outputs and measure wall time
+        if: steps.cpu.outputs.measure == 'true'
+        run: |
+          if ! "$RUNNER_TEMP/solver-venv/bin/python" -u .github/scripts/runtime_compare.py >/dev/null 2>&1; then
+            echo "::error::A runtime comparison failed. See the numeric results for the last stage."
+            exit 1
+          fi
+      - name: Seal comparison record
+        id: seal_report
+        if: always()
+        run: |
+          umask 077
+          if ! python3 .github/scripts/seal_runner.py "$RUNNER_TEMP/numeric-results" "$RUNNER_TEMP/sealed-results/record.cms" >/dev/null 2>&1; then
+            echo "::error::Unable to seal result."
+            exit 1
+          fi
+      - name: Retain sealed result
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() && steps.seal_report.outcome == 'success' }}
+        with:
+          name: timing-${{ matrix.replica }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/sealed-results/record.cms
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
