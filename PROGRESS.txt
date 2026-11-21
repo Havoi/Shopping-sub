@@ -10,16 +10,7 @@ Submission and targets
     Current 20M warm medians are 1.471, 1.514 and 1.440 s on this machine.
 [ ] Reach <0.300 s on the portal.
 
-Leaderboard research and next release
-[x] Read the track page. Scorer shopping-sessions-4 measures container start
-    to exit, with the median of three practice runs under 20 seconds. The
-    public board displayed team 67 at 0.36 s and Fraun at 0.64 s.
-[x] Compare public competitor code, benchmark independent implementations,
-    and verify the selected solver against both output tables.
-[x] Read Fraun's routing strategy, VibDiv's scored submissions and streaming
-    write benchmarks, and the session/click implementations by Js-Hwang1,
-    matthewf725 and zlyuan9. The public track page lists teams and times.
-    No first-place repository or commit could be independently confirmed.
+Release verification
 [x] Benchmark routing events to final shards during parsing. Waiting for links
     increased the 20M pipeline median from 1.137 s to 1.477 s in that trial.
 [x] Implement and test a two-click shortcut, interval-based attribution,
@@ -39,9 +30,6 @@ Leaderboard research and next release
     unit tests and the official 1M answer. The image passed all 36 fixtures.
 [x] Compare a contiguous map for each entire phase. It cut dev minor faults
     by 12–17% in two batches but lost to per-chunk storage at 20M on seed 73.
-[x] Benchmark the exact VibDiv submission 8527c64 on our machine. Median
-    local container durations were 1.358 s for b45f23d and 1.210 s for the
-    competitor that reports a 0.76 s official score. All output values agreed.
 
 20M release trials, old = b45f23d, restricted fresh Docker start to exit.
 Five trials per image on each warm seed, three per image on evicted input.
