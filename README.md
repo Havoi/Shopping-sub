@@ -11,7 +11,8 @@ identities, products, campaigns, and file counts all come from the mounted data.
 
 ## Build and run
 
-Use Linux or WSL with Docker. The final image targets linux/amd64.
+Use Linux or WSL with Docker. The linux/amd64 image selects its CPU target at
+startup. It includes a build for x86-64-v3 with AES and a generic amd64 build.
 
 ```sh
 make build
@@ -64,25 +65,47 @@ make run DATA=/path/to/seed42 OUT=/path/to/output42
 python3 scripts/compare.py /path/to/output42 /path/to/expected42
 ```
 
-Parser unit checks are available with `make test` when Rust 1.85 or later is
+CSV, timestamp, identity and compact-record unit checks are available with `make test` when Rust 1.85 or later is
 installed. `Cargo.lock` pins the dependency graph used by the Docker build.
 
 ## Local measurements
 
-The final image was tested through WSL/Docker on a laptop, with 8 pinned CPU
-threads, a 6 GiB memory limit, no swap, read-only root and inputs, uid 1000,
-and disabled networking. Wall time below includes the Docker CLI lifecycle.
+The team reported an 8-second practice score for the earlier commit
+`d6783e0`. These measurements compare that image with this one on a Ryzen 5
+5600H laptop. Each run used a fresh container, eight pinned hardware threads
+across four cores, 6 GiB, no swap, read-only inputs and disabled networking.
 
-| Generated dataset | Wall time | Pipeline time | Peak container memory |
-| --- | --- | --- | --- |
-| Seed 2026, 20M events and 5M clicks | 13.93 s | 12.484 s | 3.62 GiB |
-| Seed 99, 60M events and 15M clicks | 54.82 s | 52.293 s | 6.00 GiB |
+| Official generator, seed 2026, 20M events + 5M clicks | Previous | Optimized |
+| --- | ---: | ---: |
+| Warm Linux filesystem, median of three per image | 9.538 s | 2.009 s |
+| Linux input page cache evicted, one run per image | 9.850 s | 4.009 s |
 
-These are local measurements. Hidden scorer timings remain unmeasured.
-Both large outputs pass schema, unique-key, and cross-table total checks.
-Exact answer comparisons use the 36 fixtures, the official million-event
-answer, and the independent reference on three additional small datasets
-and an adversarial case. The large datasets have no published golden answers.
+Times use Docker's container start and exit timestamps. The warm trials ran
+in alternating order on identical input. The optimized times were 1.954,
+2.009 and 2.084 seconds. Before each cache-eviction trial, Linux reported
+zero of 459,975 input pages resident. The host's underlying storage cache
+was uncontrolled.
+
+Scaling the team's 8-second score by each measured ratio gives 1.69 seconds
+with warm input and 3.26 seconds after eviction. A practical estimate is
+2�3 seconds, with a wider 1.5�4 second planning range. The hidden seed,
+hardware, and input cache state determine the official score.
+
+A separate 60M-event, 15M-click run on seed 99 used a Windows-mounted
+directory for both images. Docker CLI wall time fell from 54.82 to
+28.63 seconds and peak container memory fell from 6.00 to 4.52 GiB.
+On a native Linux filesystem, three optimized containers took 33.552,
+12.051 and 11.241 seconds from start to exit (median 12.051 seconds).
+The WSL VM has 7.4 GiB total. File cache and the process compete for RAM
+at final scale.
+
+Both tables matched the public million-event answer and all 36 fixtures.
+Three extra seeds, a long identity chain, compact and full-width duplicate
+records, and sparse campaign totals matched the independent Python reference.
+Every output key and value at 20M and 60M matched the earlier verified image,
+including 2,224,281 and 6,648,247 user/day rows respectively and 28,014
+campaign/day rows per dataset. Large generated datasets have no published
+golden answers.
 
 For the 60M input, a scratch copy of the official generator wrote shards
 incrementally to fit local RAM. Its seed-1 output matched all 87 original
@@ -90,34 +113,44 @@ generator files byte for byte before use. Generation is outside timed runs.
 
 ## How the implementation works
 
-1. `src/parse.rs` implements the specified CSV dialect and timestamp formats.
-   Empty fields, quotes, ASCII digits, leap years, offsets, and CR bytes are
-   handled explicitly. Timestamps are integer UTC milliseconds.
-2. `src/input.rs` reads every CSV part and resolves identity links with
-   union-find. Component names are the byte-wise smallest linked IDs. The
-   pipeline interns all observed user IDs as integers, including singletons,
-   so later sorting can work from compact records. Read-only mappings keep
-   borrowed event and click IDs valid during processing.
-3. `src/main.rs` partitions events by event ID and retains the earliest
-   ingestion globally. Invalid records remain eligible to win deduplication.
-   Validation and lateness determine whether the winning record survives.
-   Short event IDs are stored directly in each record. Longer IDs retain
-   their full borrowed values. Both representations use full byte equality.
-4. Surviving events and valid clicks are partitioned by canonical person.
-   Sorting by person and time makes session formation an adjacent-gap scan.
-   A session's first timestamp determines the day of all its purchases.
-5. For each person's increasing session starts, two click indices maintain
-   the inclusive seven-day window. A count per campaign tracks active assists.
-   The latest timestamp and smallest click ID determine the credited campaign.
-   Each click enters and leaves the window at most once. Assist accumulation
-   visits each active campaign once per session.
-6. `src/output.rs` writes compressed Parquet with explicit DATE columns and
-   nullable top_category. Campaign totals combine credited and assisted rows.
+1. Read every CSV shard and skip its own header. The tuned parser scans comma,
+   newline and quote positions with AVX2. It checks that quoted fields open
+   and close at the correct boundaries. Longer rows use the same strict scalar
+   rules. Calendar validation is cached by date and timestamps retain millisecond
+   precision.
+2. Build the transitive graph of linked user IDs with union-find while other
+   threads scan the events. Keep the smallest UTF-8 name in each component.
+   Short user names fit in a machine word. All other names retain their exact
+   bytes in an interner. An event can be scanned before the graph finishes
+   because its raw user key can be resolved afterward.
+3. Partition by **event ID** and choose the earliest ingestion across all files.
+   An invalid earliest copy still suppresses a later valid copy, even if the
+   copies name different users. Two bitmaps identify hash slots that occur only
+   once. A repeated slot always goes through exact key comparisons. The common
+   nonpurchase record occupies 24 bytes including its event key. Purchases,
+   longer IDs and wider time ranges have full-width representations.
+4. Partition surviving events and valid clicks by canonical person. Sort each
+   partition by person and time, breaking click ties by original ID bytes.
+   An adjacent gap greater than 1,800,000 ms starts a session. All its events
+   and revenue belong to the UTC day on which it started.
+5. Move two indices through the person's sorted clicks as session starts
+   advance. The inclusive seven-day window supplies both the last eligible
+   click and all the distinct assisting campaigns. Small campaign/day tables
+   use direct indexing. Large calendars or catalogs use a sparse table.
+6. Write each shard's user rows directly to Parquet. Consecutive rows for a
+   person share one dictionary entry and a run-length encoded index. Merge
+   campaign counts across shards and write the campaign table. Empty outputs
+   still carry the required schema.
 
-Global event deduplication precedes partitioning by person because later copies
-can name a different user. Equal event timestamps stay together, and purchases
-after midnight remain assigned to their session's start day. String comparisons
-preserve the original UTF-8 bytes throughout.
+For example, a phone view at 23:55 and a linked laptop purchase at 00:10
+belong to one session on the first date. If campaign A had a click two days
+earlier and B had the latest click at 23:54, B receives the session and
+purchase revenue. A and B each receive one assist. A click at 23:56 is too
+late to receive credit for this session, even though it precedes the purchase.
+
+For background on classifying many input bytes into structural masks at once,
+see Langdale and Lemire's [SIMD parsing paper](https://arxiv.org/abs/1902.08318).
+The user-ID writer follows the [Apache Parquet dictionary and RLE formats](https://parquet.apache.org/docs/file-format/data-pages/encodings/).
 
 ## Storage and submission
 

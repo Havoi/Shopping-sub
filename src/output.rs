@@ -4,15 +4,15 @@ use std::sync::Arc;
 
 use parquet::basic::Compression;
 use parquet::data_type::{ByteArray, ByteArrayType, Int32Type, Int64Type};
-use parquet::file::properties::WriterProperties;
+use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::file::writer::{SerializedFileWriter, SerializedRowGroupWriter};
 use parquet::schema::parser::parse_message_type;
 
-use crate::input::Dimensions;
+use crate::input::{Dimensions, People};
 use crate::{CampaignTotals, Result};
 
-pub struct UserDay<'a> {
-    pub person: &'a [u8],
+pub struct UserDay {
+    pub person: u64,
     pub day: i32,
     pub sessions: i64,
     pub events: i64,
@@ -24,6 +24,10 @@ fn writer(path: &Path, schema: &str) -> Result<SerializedFileWriter<File>> {
     fs::create_dir_all(path.parent().unwrap())?;
     let properties = WriterProperties::builder()
         .set_compression(Compression::SNAPPY)
+        .set_dictionary_enabled(false)
+        .set_statistics_enabled(EnabledStatistics::None)
+        .set_offset_index_disabled(true)
+        .set_write_batch_size(8192)
         .build();
     Ok(SerializedFileWriter::new(
         File::create(path)?,
@@ -71,7 +75,119 @@ fn dates(
     Ok(())
 }
 
-pub fn users(path: &Path, rows: &[UserDay<'_>], dimensions: &Dimensions) -> Result<()> {
+// Each user occupies a consecutive run of rows. Build the dictionary directly
+// from those runs. Its order is independent of the person key's byte ordering.
+fn user_ids(
+    group: &mut SerializedRowGroupWriter<'_, File>,
+    rows: &[UserDay],
+    people: &People,
+    column: parquet::schema::types::ColumnDescPtr,
+) -> Result<()> {
+    use bytes::Bytes;
+    use parquet::basic::Encoding;
+    use parquet::column::page::{CompressedPage, Page, PageWriter};
+    use parquet::column::writer::ColumnCloseResult;
+    use parquet::file::metadata::ColumnChunkMetaData;
+    use parquet::file::writer::{SerializedPageWriter, TrackedWrite};
+
+    let runs = rows.chunk_by(|a, b| a.person == b.person);
+    let count = rows.chunk_by(|a, b| a.person == b.person).count();
+    let bit_width = (usize::BITS - (count - 1).leading_zeros()).max(1) as u8;
+    let index_bytes = usize::from(bit_width).div_ceil(8);
+
+    let mut dictionary = Vec::with_capacity(count * 13);
+    let mut indices = Vec::with_capacity(1 + count * (index_bytes + 1));
+    indices.push(bit_width);
+
+    for (index, run) in runs.enumerate() {
+        let name = people.name(run[0].person);
+        let length = i32::try_from(name.len())?;
+        if dictionary.len().saturating_add(name.len() + 4) > 16 * 1024 * 1024 {
+            // Many unusually long names can exceed a single Parquet page.
+            // Let the standard writer split this group into bounded pages.
+            let mut values = Vec::with_capacity(rows.len());
+            for run in rows.chunk_by(|a, b| a.person == b.person) {
+                let name = ByteArray::from(people.name(run[0].person));
+                values.resize(values.len() + run.len(), name);
+            }
+            let mut writer = group.next_column()?.unwrap();
+            writer
+                .typed::<ByteArrayType>()
+                .write_batch(&values, None, None)?;
+            writer.close()?;
+            return Ok(());
+        }
+        dictionary.extend_from_slice(&length.to_le_bytes());
+        dictionary.extend_from_slice(&name);
+        let mut header = run.len() << 1;
+        while header >= 128 {
+            indices.push((header as u8) | 0x80);
+            header >>= 7;
+        }
+        indices.push(header as u8);
+        indices.extend_from_slice(&index.to_le_bytes()[..index_bytes]);
+    }
+
+    let mut sink = TrackedWrite::new(Vec::new());
+    let mut pages = SerializedPageWriter::new(&mut sink);
+    let size = dictionary.len();
+    let dict = pages.write_page(CompressedPage::new(
+        Page::DictionaryPage {
+            buf: dictionary.into(),
+            num_values: count as u32,
+            encoding: Encoding::PLAIN,
+            is_sorted: false,
+        },
+        size,
+    ))?;
+    let size = indices.len();
+    let data = pages.write_page(CompressedPage::new(
+        Page::DataPage {
+            buf: indices.into(),
+            num_values: rows.len() as u32,
+            encoding: Encoding::RLE_DICTIONARY,
+            def_level_encoding: Encoding::RLE,
+            rep_level_encoding: Encoding::RLE,
+            statistics: None,
+        },
+        size,
+    ))?;
+    pages.close()?;
+    let wire = Bytes::from(sink.into_inner()?);
+    let size = wire.len();
+    let metadata = ColumnChunkMetaData::builder(column)
+        .set_encodings(vec![
+            Encoding::PLAIN,
+            Encoding::RLE_DICTIONARY,
+            Encoding::RLE,
+        ])
+        .set_compression(Compression::UNCOMPRESSED)
+        .set_total_compressed_size(size as i64)
+        .set_total_uncompressed_size(size as i64)
+        .set_num_values(rows.len() as i64)
+        .set_dictionary_page_offset(Some(dict.offset as i64))
+        .set_data_page_offset(data.offset as i64)
+        .build()?;
+    group.append_column(
+        &wire,
+        ColumnCloseResult {
+            bytes_written: size as u64,
+            rows_written: rows.len() as u64,
+            metadata,
+            bloom_filter: None,
+            column_index: None,
+            offset_index: None,
+        },
+    )?;
+    Ok(())
+}
+
+pub fn users(
+    path: &Path,
+    rows: &[UserDay],
+    people: &People,
+    dimensions: &Dimensions,
+) -> Result<()> {
     let mut file = writer(
         path,
         "message user_daily {
@@ -83,9 +199,15 @@ pub fn users(path: &Path, rows: &[UserDay<'_>], dimensions: &Dimensions) -> Resu
         OPTIONAL BINARY top_category (UTF8);
     }",
     )?;
+    let category_values: Vec<_> = dimensions
+        .categories
+        .iter()
+        .map(|s| ByteArray::from(s.as_slice()))
+        .collect();
     for batch in rows.chunks(65536) {
+        let user_column = file.schema_descr().column(0);
         let mut group = file.next_row_group()?;
-        strings(&mut group, batch.iter().map(|row| row.person))?;
+        user_ids(&mut group, batch, people, user_column)?;
         dates(&mut group, batch.iter().map(|row| row.day))?;
         integers(&mut group, batch.iter().map(|row| row.sessions))?;
         integers(&mut group, batch.iter().map(|row| row.events))?;
@@ -97,7 +219,7 @@ pub fn users(path: &Path, rows: &[UserDay<'_>], dimensions: &Dimensions) -> Resu
         let values: Vec<_> = batch
             .iter()
             .filter_map(|row| row.category)
-            .map(|category| ByteArray::from(dimensions.categories[category as usize].as_slice()))
+            .map(|category| category_values[category as usize].clone())
             .collect();
         let mut column = group.next_column()?.unwrap();
         column

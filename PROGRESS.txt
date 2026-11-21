@@ -1,103 +1,80 @@
-Shopping Sessions challenge progress
+Shopping Sessions progress checklist
 Updated 2026-11-21, Asia/Kolkata
 
-[x] Read rules.md, the competition brief, and starter scripts.
-[x] Configure Linux testing through WSL and Docker on D:.
-[x] Extract the 36 official fixtures and comparison scripts.
-[x] Build the official generator and generate the public development data.
-[x] Implement the complete pipeline in Rust.
-[x] Pass all 3 unit checks.
-[x] Pass all 36 official fixtures with the final Docker image.
-[x] Match both official million-event answer tables exactly.
-[x] Match an independent reference on 3 additional seeds.
-[x] Match an adversarial case with a 1,000-link identity chain.
-[x] Build and test the image with scorer filesystem and network restrictions.
-[x] Benchmark 20M events and 5M clicks.
-[x] Diagnose and fix final-scale performance under memory pressure.
-[x] Complete 60M events and 15M clicks within the local 180-second cap.
-[x] Validate schemas, unique keys, and aggregate consistency at large scale.
-[x] Add reproducible commands and an implementation walkthrough.
-[x] Check image and submission source sizes.
-[x] Initialize the local Git repository with generated data excluded.
-[x] Finish the verification summary and record remaining limitations.
-[x] Publish the verified solution to Havoi/Shopping-sub.
-[ ] Submit a commit to the competition scorer.
-
-Current status
-Local implementation and verification are complete. The solution is published
-on the main branch of https://github.com/Havoi/Shopping-sub.
-Competition submission and scoring are pending.
-
-Final-image benchmarks
-20M events and 5M clicks, seed 2026
-  Total Docker CLI wall time       13.93 seconds
-  Pipeline time                    12.484 seconds
-  Peak container memory            3887398912 bytes, about 3.62 GiB
-
-60M events and 15M clicks, seed 99
-  Total Docker CLI wall time       54.82 seconds
-  Pipeline time                    52.293 seconds
-  Peak container memory            6442450944 bytes, 6 GiB
-
-Both used 8 pinned CPU threads, a 6 GiB container memory limit, no swap,
-uid 1000, read-only root and inputs, and disabled networking. The scorer
-provides 24 GiB. Local laptop timings do not establish hidden scorer times.
-
-Portal timing estimate
-A fresh 20M rerun completed in 14.13 seconds of Docker CLI wall time and
-12.779 seconds inside the pipeline, close to the previous 13.93-second run.
-The laptop uses a Ryzen 5 5600H. The selected WSL CPU set reports 8 threads
-across 4 cores. The portal uses Intel Xeon N2 hardware and a different seed.
-The engineering estimate is about 20 seconds, with a planning range of
-15 to 30 seconds. CPU, storage/cache state, and seed differences remain
-unmeasured on the portal. This estimate covers the scored execution.
-
-Correctness verification
-The final image passed all 36 supplied fixtures through its normal entry
-point with the supplied Docker runner. Both public answer tables matched
-exactly, with zero missing rows, extra rows, differences, or duplicate keys.
-The public result has 117038 user/day rows and 27400 campaign/day rows.
-
-An independent Python implementation matched seeds 2, 17, and 42 at
-30K events and 10K clicks each. An additional adversarial dataset covered
-a long identity chain, an unused canonical ID, leap-day and midnight
-sessions, invalid early duplicates, malformed quoting, CR bytes, and ties.
-
-The final-scale result has 6648247 user/day rows and 28014 campaign/day
-rows. Both tables total 10055848 sessions and 19223422711 revenue cents.
-Schema, unique-key, purchasing-session, and attribution-total checks passed.
-Large generated datasets have no supplied golden answers. Their checks
-complement the exact comparisons on the public and independent datasets.
-
-Implementation
-Strict CSV and timestamp parsing.
-Union-find identity resolution followed by integer person IDs.
-Global event-ID deduplication before invalid or late records are removed.
-Full short event IDs stored inline, with full borrowed values for long IDs.
-Time-ordered session scans and seven-day campaign attribution windows.
-Explicit Parquet schemas, DATE columns, and nullable top categories.
+Submission
+[x] Implement the event, identity, session, attribution and Parquet rules.
+[x] Publish the first verified solution to Havoi/Shopping-sub, commit d6783e0.
+[x] Record the team's reported practice result of 8 seconds, rank 178.
+    The team reported about 0.5 seconds for first place.
+[x] Build a faster release with both tuned and generic amd64 executables.
+[x] Publish the verified optimized release on the same public main branch.
+[ ] Obtain an official portal score for the new commit.
 
 Performance work
-Two early 60M runs timed out during deduplication at the local 6 GiB limit.
-Integer person IDs reduced sorting costs. Storing short event IDs inline
-removed scattered CSV reads during duplicate comparisons. Deduplication
-then took about 3.4 seconds at final scale. The compact binary first
-completed in 56.77 seconds, followed by the final-image run in 54.82 seconds.
+[x] Eliminate the event/click prepass for user interning. Build identity links
+    concurrently with event parsing and retain byte-exact fallback IDs.
+[x] Benchmark SIMD CSV parsing, date caching, shorter event records, and
+    exact global deduplication with a bitmap fast path for singleton slots.
+[x] Compare partition counts, allocation size hints, identity prefetch,
+    comparison and radix sorting, and Parquet encodings end to end.
+[x] Write UTF-8 user IDs as dictionary entries plus run lengths. The writer
+    reproduced all 2,224,281 practice user rows across the 64 old partitions.
+    PyArrow and Polars also decoded synthetic multi-group, Unicode, embedded
+    NUL, and maximum dictionary-width cases.
+[x] Benchmark the old and new release images on the same warm 20M input.
+[x] Measure sensitivity to evicting the Linux input file cache.
+[x] Test 60M events and 15M clicks under a 6 GiB limit with swap disabled.
+[x] Run three fresh final-scale containers on the native Linux filesystem.
 
-Generation and packaging
-The 60M input was generated with a scratch copy of the official generator
-that writes shards incrementally to fit local RAM. Its seed-1 output
-matched all 87 original-generator files byte for byte before use.
-Input generation is outside the timed pipeline runs.
-The final Docker image is 28808658 bytes, about 27.5 MiB.
-Submission source and small fixtures are under 1 MB before Git metadata.
-Fixture bytes are protected from Git newline conversion.
+20M practice benchmark, official generator, seed 2026, plus 5M clicks
+Eight pinned hardware threads on four Ryzen 5 5600H cores, 6 GiB, fresh
+Docker containers, read-only inputs and root, uid 1000, no network or swap.
+The duration is the Docker start timestamp through its exit timestamp.
 
-Workspace
-D:\Sem2\Sem 5\Buildathon\Shopping-Databrics
+                    Warm trials in run order (seconds)    Warm median    Evicted
+  Previous image    9.538, 9.343, 9.962                   9.538          9.850
+  Optimized image   2.009, 1.954, 2.084                   2.009          4.009
 
-Generated datasets, downloads, outputs, and build cache
-D:\ChatGPT-Codex\tmp\shopping-sessions
+The six warm trials were interleaved. Eviction was per input file. Linux
+reported 0 of 459,975 input pages resident before each evicted run. The
+underlying host storage cache was uncontrolled. Each evicted timing is one run.
 
-Task action log
-D:\ChatGPT-Codex\logs\agent-actions.jsonl
+Portal estimate
+Applying the two local ratios to the team's reported 8-second score gives
+1.69 seconds warm and 3.26 seconds after eviction. Plan around 2-3 seconds,
+with a wider 1.5-4 second range for hardware, seed and cache differences.
+Only the portal can establish the new score or rank.
+
+60M final-scale benchmark, official generator, seed 99, plus 15M clicks
+Same Windows-mounted files and 6 GiB cap used for the earlier measurement.
+  Previous image: 54.82 seconds Docker wall, 52.293 seconds pipeline, 6.00 GiB peak.
+  Optimized image: 28.63 seconds Docker wall, 27.173 seconds pipeline, 4.52 GiB peak.
+Native Linux filesystem, three fresh container start-to-exit measurements:
+  33.552, 12.051 and 11.241 seconds, median 12.051 seconds.
+The input was read once before these trials. The entire WSL VM has 7.4 GiB,
+so the input and working allocations compete for RAM at final scale.
+The 60M generator used an incremental scratch writer to fit local memory.
+Its seed-1 outputs matched all 87 original generator files byte for byte.
+
+Correctness and packaging
+[x] Earlier submission passed all 36 official fixtures, matched the public
+    development answer and three independent seeds, and passed large-data checks.
+[x] Pass all 8 release unit tests in both tuned and generic builds.
+[x] Pass all 36 official fixtures with the optimized Docker entry point.
+[x] Match the public million-event development answer in tuned and generic mode:
+    117,038 user/day rows and 27,400 campaign/day rows, zero differences.
+[x] Match seeds 2, 17 and 42, and the 1,000-link adversarial identity case.
+[x] Check compact and full-width duplicate candidates, long windows and
+    sparse campaign totals against the independent Python reference.
+[x] Compare every row and schema from seed 2026 (20M) and seed 99 (60M)
+    with earlier verified outputs, checking unique keys.
+    User/day rows: 2,224,281 (20M), 6,648,247 (60M). Campaign/day rows:
+    28,014 in each. Every schema, key and value matched. At full scale the
+    two tables agree on 10,055,848 sessions and 19,223,422,711 revenue cents.
+    Large comparisons use the previous verified image; official answers are
+    published for the fixtures and the public million-event development set.
+[x] Verify image size: 29,430,144 bytes. Generated data and scratch stay on D:.
+
+Workspace: D:\Sem2\Sem 5\Buildathon\Shopping-Databrics
+Scratch and measurements: D:\ChatGPT-Codex\tmp\shopping-sessions
+Task action log: D:\ChatGPT-Codex\logs\agent-actions.jsonl

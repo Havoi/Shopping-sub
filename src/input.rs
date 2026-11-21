@@ -1,11 +1,11 @@
 use std::fs::{self, File};
 use std::path::Path;
+use std::sync::{Arc, OnceLock, RwLock};
 
-use ahash::{AHashMap, AHashSet};
+use ahash::AHashMap;
 use memmap2::Mmap;
-use rayon::prelude::*;
 
-use crate::parse::{fields, lines};
+use crate::parse::{fields, lines, rows};
 use crate::Result;
 
 pub struct Inputs {
@@ -55,155 +55,386 @@ impl Inputs {
     }
 }
 
-fn find(parent: &mut [usize], mut node: usize) -> usize {
-    while parent[node] != node {
-        parent[node] = parent[parent[node]];
-        node = parent[node];
-    }
-    node
-}
+const GENERIC: u64 = 1 << 63;
+const INTERNED: u64 = 3 << 62;
 
-pub fn linked_people(input: &Inputs) -> AHashMap<&[u8], &[u8]> {
-    let mut nodes = AHashMap::new();
-    let mut parent = Vec::new();
-    let mut sizes = Vec::new();
-    let mut smallest = Vec::new();
-    for chunk in input.chunks() {
-        for line in lines(chunk) {
-            let Some([a, b]) = fields::<2>(line) else {
-                continue;
-            };
-            if a.is_empty() || b.is_empty() {
-                continue;
-            }
-            let mut pair = [0; 2];
-            for (at, name) in [a, b].into_iter().enumerate() {
-                pair[at] = *nodes.entry(name).or_insert_with(|| {
-                    let index = parent.len();
-                    parent.push(index);
-                    sizes.push(1);
-                    smallest.push(name);
-                    index
-                });
-            }
-            let mut left = find(&mut parent, pair[0]);
-            let mut right = find(&mut parent, pair[1]);
-            if left != right {
-                if sizes[left] < sizes[right] {
-                    std::mem::swap(&mut left, &mut right);
-                }
-                parent[right] = left;
-                sizes[left] += sizes[right];
-                smallest[left] = smallest[left].min(smallest[right]);
-            }
+// The most common representation stores a 'u' prefix and up to eight suffix
+// bytes. A second range stores arbitrary short strings. A third refers to
+// exact byte strings in the interner. A terminal NUL takes the interner path
+// because the inline representation uses trailing zero padding.
+#[inline]
+fn inline_user(name: &[u8]) -> Option<u64> {
+    if name.len() == 9 && name[0] == b'u' {
+        let last = name[8];
+        if last != 0 && last < 0x80 {
+            return Some(u64::from_le_bytes(name[1..9].try_into().unwrap()));
         }
     }
-    nodes
-        .into_iter()
-        .map(|(name, index)| (name, smallest[find(&mut parent, index)]))
-        .collect()
+    if name.first() == Some(&b'u') && name.len() <= 9 {
+        let suffix = &name[1..];
+        if suffix.last() == Some(&0) {
+            return None;
+        }
+        let mut bytes = [0; 8];
+        bytes[..suffix.len()].copy_from_slice(suffix);
+        let word = u64::from_le_bytes(bytes);
+        if word & GENERIC == 0 {
+            return Some(word);
+        }
+    }
+    if name.len() <= 7 && name.last() != Some(&0) {
+        let mut bytes = [0; 8];
+        bytes[..name.len()].copy_from_slice(name);
+        return Some(GENERIC | u64::from_le_bytes(bytes));
+    }
+    None
+}
+
+#[derive(Default)]
+struct LongNames {
+    ids: AHashMap<Arc<[u8]>, u64>,
+    names: Vec<Arc<[u8]>>,
+}
+
+impl LongNames {
+    fn intern(&mut self, name: &[u8]) -> u64 {
+        if let Some(key) = self.ids.get(name) {
+            return *key;
+        }
+        let key = INTERNED | self.names.len() as u64;
+        let name: Arc<[u8]> = name.into();
+        self.names.push(name.clone());
+        self.ids.insert(name, key);
+        key
+    }
+}
+
+// Inline generic keys occupy only the low 56 bits below their tag. This
+// unused tag value cannot be produced by inline_user or the interner.
+const VACANT: u64 = GENERIC | (1 << 60);
+
+#[derive(Clone, Copy)]
+struct Slot {
+    key: u64,
+    value: u64,
+}
+
+// Keys and values occupy the same cache line on a successful lookup.
+// Linear probing also fetches neighbouring candidates on collisions.
+struct AliasTable {
+    slots: Vec<Slot>,
+    shift: u32,
+    len: usize,
+}
+
+impl AliasTable {
+    fn reserve(expected: usize) -> Self {
+        let capacity = (expected + expected / 2 + 8).next_power_of_two();
+        Self {
+            slots: vec![
+                Slot {
+                    key: VACANT,
+                    value: 0
+                };
+                capacity
+            ],
+            shift: 64 - capacity.trailing_zeros(),
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn bucket(&self, key: u64) -> usize {
+        let mixed = (key ^ (key >> 29)).wrapping_mul(0x9e3779b97f4a7c15);
+        (mixed >> self.shift) as usize
+    }
+
+    #[inline]
+    fn position(&self, key: u64) -> usize {
+        let mut index = self.bucket(key);
+        let mask = self.slots.len() - 1;
+        loop {
+            let candidate = self.slots[index].key;
+            if candidate == VACANT || candidate == key {
+                return index;
+            }
+            index = (index + 1) & mask;
+        }
+    }
+
+    #[inline]
+    fn get(&self, key: u64) -> u64 {
+        let slot = self.slots[self.position(key)];
+        if slot.key == key {
+            slot.value
+        } else {
+            key
+        }
+    }
+
+    fn insert(&mut self, key: u64, new_value: u64) -> u64 {
+        // A table with at least one empty slot always terminates probing.
+        if self.len >= self.slots.len() * 2 / 3 {
+            let mut larger = Self::reserve(self.slots.len());
+            for &slot in &self.slots {
+                if slot.key != VACANT {
+                    let index = larger.position(slot.key);
+                    larger.slots[index] = slot;
+                }
+            }
+            larger.len = self.len;
+            *self = larger;
+        }
+        let index = self.position(key);
+        let entry = &mut self.slots[index];
+        if entry.key == VACANT {
+            *entry = Slot {
+                key,
+                value: new_value,
+            };
+            self.len += 1;
+        }
+        entry.value
+    }
+}
+
+struct Node {
+    parent: u32,
+    size: u32,
+    minimum: u64,
+}
+
+fn root(nodes: &mut [Node], mut id: u32) -> u32 {
+    while nodes[id as usize].parent != id {
+        let parent = nodes[id as usize].parent;
+        let grandparent = nodes[parent as usize].parent;
+        nodes[id as usize].parent = grandparent;
+        id = grandparent;
+    }
+    id
 }
 
 pub struct People {
-    pub ids: AHashMap<Vec<u8>, u32>,
-    pub names: Vec<Vec<u8>>,
+    aliases: OnceLock<AliasTable>,
+    long: RwLock<LongNames>,
 }
 
 impl People {
-    pub fn load(links: &Inputs, events: &Inputs, clicks: &Inputs) -> Self {
-        let linked = linked_people(links);
-        let mut names = Vec::new();
-        let mut components = AHashMap::new();
-        let mut ids = AHashMap::with_capacity(linked.len());
-        for (&id, &name) in &linked {
-            let index = *components.entry(name).or_insert_with(|| {
-                let index = names.len() as u32;
-                names.push(name.to_vec());
-                index
-            });
-            ids.insert(id.to_vec(), index);
+    pub fn new() -> Self {
+        Self {
+            aliases: OnceLock::new(),
+            long: RwLock::new(LongNames::default()),
         }
-        drop(components);
-        drop(linked);
+    }
 
-        // Intern singleton IDs too, so sorting never needs to revisit scattered
-        // user strings in the large CSV maps after the parsing phase.
-        let chunks: Vec<_> = events
-            .chunks()
-            .into_iter()
-            .map(|bytes| (7, bytes))
-            .chain(clicks.chunks().into_iter().map(|bytes| (4, bytes)))
-            .collect();
-        let unlinked = chunks
-            .par_iter()
-            .fold(AHashSet::new, |mut found, &(width, bytes)| {
-                for line in lines(bytes) {
-                    let user = if width == 7 {
-                        fields::<7>(line).map(|row| row[1])
-                    } else {
-                        fields::<4>(line).map(|row| row[1])
-                    };
-                    if let Some(user) =
-                        user.filter(|user| !user.is_empty() && !ids.contains_key(*user))
-                    {
-                        found.insert(user);
+    pub fn load_links(&self, links: &Inputs) {
+        let mut indexes = AliasTable::reserve((links.bytes() / 14).min(4 << 20));
+        let mut nodes = Vec::new();
+        let mut unions = 0;
+        for chunk in links.chunks() {
+            for [a, b] in rows::<2>(chunk) {
+                if a.is_empty() || b.is_empty() {
+                    continue;
+                }
+                let mut component = [0; 2];
+                for (out, name) in component.iter_mut().zip([a, b]) {
+                    let key = self.key(name);
+                    let next = nodes.len() as u64;
+                    let id = indexes.insert(key, next);
+                    if id == next {
+                        nodes.push(Node {
+                            parent: id as u32,
+                            size: 1,
+                            minimum: key,
+                        });
                     }
+                    *out = root(&mut nodes, id as u32);
                 }
-                found
-            })
-            .reduce(AHashSet::new, |mut left, mut right| {
-                if left.len() < right.len() {
-                    std::mem::swap(&mut left, &mut right);
+                let [mut left, mut right] = component.map(|id| id as usize);
+                if left != right {
+                    if nodes[left].size < nodes[right].size {
+                        std::mem::swap(&mut left, &mut right);
+                    }
+                    nodes[right].parent = left as u32;
+                    nodes[left].size += nodes[right].size;
+                    let right_min = nodes[right].minimum;
+                    let left_min = nodes[left].minimum;
+                    // For inline IDs with the same implicit prefix, comparing
+                    // bytes in reverse native order implements UTF-8 byte order.
+                    let less = if (right_min & GENERIC == 0 && left_min & GENERIC == 0)
+                        || (right_min & INTERNED == GENERIC && left_min & INTERNED == GENERIC)
+                    {
+                        right_min.swap_bytes() < left_min.swap_bytes()
+                    } else {
+                        self.name(right_min) < self.name(left_min)
+                    };
+                    if less {
+                        nodes[left].minimum = right_min;
+                    }
+                    unions += 1;
                 }
-                left.extend(right);
-                left
-            });
-        for user in unlinked {
-            let index = names.len() as u32;
-            names.push(user.to_vec());
-            ids.insert(user.to_vec(), index);
+            }
         }
-        Self { ids, names }
+        // From now on, only aliases need a stored mapping. Every missing key
+        // already encodes its exact singleton or canonical name.
+        let mut aliases = AliasTable::reserve(unions);
+        for slot in indexes.slots {
+            if slot.key != VACANT {
+                let id = root(&mut nodes, slot.value as u32);
+                let canonical = nodes[id as usize].minimum;
+                if slot.key != canonical {
+                    aliases.insert(slot.key, canonical);
+                }
+            }
+        }
+        assert!(self.aliases.set(aliases).is_ok(), "links already loaded");
+    }
+
+    #[inline]
+    pub fn key(&self, name: &[u8]) -> u64 {
+        inline_user(name).unwrap_or_else(|| self.intern_long(name))
+    }
+
+    #[inline]
+    pub fn canonical(&self, key: u64) -> u64 {
+        self.aliases.get().expect("links must be loaded").get(key)
+    }
+
+    #[inline]
+    pub fn resolve(&self, name: &[u8]) -> u64 {
+        self.canonical(self.key(name))
+    }
+
+    #[cold]
+    fn intern_long(&self, name: &[u8]) -> u64 {
+        if let Some(key) = self.long.read().unwrap().ids.get(name) {
+            return *key;
+        }
+        self.long.write().unwrap().intern(name)
+    }
+
+    pub fn name(&self, key: u64) -> Vec<u8> {
+        if key & INTERNED == INTERNED {
+            return self.long.read().unwrap().names[(key & !INTERNED) as usize].to_vec();
+        }
+        let bytes = (key & !GENERIC).to_le_bytes();
+        let length = bytes
+            .iter()
+            .rposition(|&byte| byte != 0)
+            .map_or(0, |index| index + 1);
+        let mut name = Vec::with_capacity(length + 1);
+        if key & GENERIC == 0 {
+            name.push(b'u');
+        }
+        name.extend_from_slice(&bytes[..length]);
+        name
+    }
+
+    pub fn len(&self) -> usize {
+        self.aliases.get().map_or(0, |aliases| aliases.len)
+    }
+}
+
+struct DimensionIndex {
+    prefix: &'static [u8],
+    dense: Vec<u32>,
+    other: AHashMap<Vec<u8>, u32>,
+}
+
+impl DimensionIndex {
+    fn new(prefix: &'static [u8], rows: usize) -> Self {
+        Self {
+            prefix,
+            dense: vec![u32::MAX; rows + 1],
+            other: AHashMap::new(),
+        }
+    }
+
+    // Only the canonical ASCII decimal spelling can index the array. IDs
+    // with leading zeros or arbitrary bytes use exact byte matching.
+    #[inline]
+    fn slot(&self, name: &[u8]) -> Option<usize> {
+        let value = name.strip_prefix(self.prefix)?;
+        if value.is_empty() || value.len() > 8 || (value.len() > 1 && value[0] == b'0') {
+            return None;
+        }
+        let mut index = 0;
+        for byte in value {
+            let digit = byte.wrapping_sub(b'0');
+            if digit > 9 {
+                return None;
+            }
+            index = 10 * index + usize::from(digit);
+        }
+        (index < self.dense.len()).then_some(index)
+    }
+
+    fn insert(&mut self, name: &[u8], value: u32) {
+        if let Some(index) = self.slot(name) {
+            self.dense[index] = value;
+        } else {
+            self.other.insert(name.to_vec(), value);
+        }
+    }
+
+    #[inline]
+    fn get(&self, name: &[u8]) -> Option<&u32> {
+        if let Some(index) = self.slot(name) {
+            let value = &self.dense[index];
+            (*value != u32::MAX).then_some(value)
+        } else {
+            self.other.get(name)
+        }
     }
 }
 
 pub struct Dimensions {
-    pub products: AHashMap<Vec<u8>, u32>,
+    products: DimensionIndex,
     pub categories: Vec<Vec<u8>>,
     pub unknown: u32,
-    pub campaigns: AHashMap<Vec<u8>, u32>,
+    campaigns: DimensionIndex,
     pub campaign_names: Vec<Vec<u8>>,
     pub channels: Vec<Vec<u8>>,
     pub organic: u32,
 }
 
 impl Dimensions {
+    #[inline]
+    pub fn category_for(&self, product: &[u8]) -> u32 {
+        self.products.get(product).copied().unwrap_or(self.unknown)
+    }
+
+    #[inline]
+    pub fn campaign_for(&self, campaign: &[u8]) -> Option<u32> {
+        self.campaigns.get(campaign).copied()
+    }
+
     pub fn load(data: &Path) -> Result<Self> {
         let product_bytes = fs::read(data.join("products.csv"))?;
         let product_rows: Vec<_> = lines(&product_bytes)
             .skip(1)
             .filter_map(fields::<2>)
             .collect();
-        let mut categories: Vec<Vec<u8>> = product_rows.iter().map(|row| row[1].to_vec()).collect();
-        categories.push(b"unknown".to_vec());
-        categories.sort();
-        categories.dedup();
-        let unknown = categories.binary_search(&b"unknown".to_vec()).unwrap() as u32;
-        let products = product_rows
-            .into_iter()
-            .map(|[product, category]| {
-                let index = categories
-                    .binary_search_by(|value| value.as_slice().cmp(category))
-                    .unwrap();
-                (product.to_vec(), index as u32)
-            })
-            .collect();
+        let mut labels: Vec<&[u8]> = product_rows.iter().map(|row| row[1]).collect();
+        labels.push(b"unknown");
+        labels.sort_unstable();
+        labels.dedup();
+        let unknown = labels.binary_search(&b"unknown".as_slice()).unwrap() as u32;
+        let mut products = DimensionIndex::new(b"p", product_rows.len());
+        for [product, category] in product_rows {
+            products.insert(product, labels.binary_search(&category).unwrap() as u32);
+        }
+        let categories = labels.into_iter().map(Vec::from).collect();
         let campaign_bytes = fs::read(data.join("campaigns.csv"))?;
-        let mut campaigns = AHashMap::new();
+        let campaign_rows: Vec<_> = lines(&campaign_bytes)
+            .skip(1)
+            .filter_map(fields::<2>)
+            .collect();
+        let mut campaigns = DimensionIndex::new(b"c_", campaign_rows.len());
         let mut campaign_names = Vec::new();
         let mut channels = Vec::new();
-        for [campaign, channel] in lines(&campaign_bytes).skip(1).filter_map(fields::<2>) {
-            campaigns.insert(campaign.to_vec(), campaign_names.len() as u32);
+        for [campaign, channel] in campaign_rows {
+            campaigns.insert(campaign, campaign_names.len() as u32);
             campaign_names.push(campaign.to_vec());
             channels.push(channel.to_vec());
         }
@@ -219,5 +450,54 @@ impl Dimensions {
             channels,
             organic,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn user_keys_roundtrip_exact_bytes_in_all_representations() {
+        let people = People::new();
+        let values: &[&[u8]] = &[
+            b"",
+            b"u",
+            b"u\0",
+            b"u\0a",
+            b"a",
+            b"a\0",
+            b"u12345678",
+            b"u1234567\0",
+            b"u12345678\0",
+            b"1234567",
+            b"12345678",
+            b"u1234567\x80",
+            "雪".as_bytes(),
+            "u雪雪雪".as_bytes(),
+        ];
+        let mut keys = HashSet::new();
+        for &value in values {
+            let key = people.key(value);
+            assert!(keys.insert(key));
+            assert_eq!(people.key(value), key);
+            assert_eq!(people.name(key), value);
+        }
+    }
+
+    #[test]
+    fn dense_dimension_slots_keep_noncanonical_names_distinct() {
+        let mut campaigns = DimensionIndex::new(b"c_", 4);
+        for (index, name) in [b"c_2".as_slice(), b"c_02", b"c_22", b"other", b"c_2\0"]
+            .iter()
+            .enumerate()
+        {
+            campaigns.insert(name, index as u32);
+            assert_eq!(campaigns.get(name), Some(&(index as u32)));
+        }
+        assert_eq!(campaigns.get(b"c_2"), Some(&0));
+        assert_eq!(campaigns.get(b"c_1"), None);
+        assert_eq!(campaigns.get(b"c_0002"), None);
     }
 }

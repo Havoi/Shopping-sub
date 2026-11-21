@@ -1,11 +1,10 @@
+mod ingest;
 mod input;
 mod output;
 mod parse;
 
-use std::collections::hash_map::Entry;
 use std::env;
 use std::fs;
-use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -14,84 +13,132 @@ use rayon::prelude::*;
 
 use input::{Dimensions, Inputs, People};
 use output::UserDay;
-use parse::{fields, lines, timestamp, unsigned, DAY, SESSION_GAP, WEEK};
+use parse::{timestamp, DAY, SESSION_GAP, WEEK};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 type CampaignTotals = AHashMap<(u32, i32), CampaignStats>;
 
 #[derive(Clone, Copy)]
-enum EventKey<'a> {
-    Inline { bytes: [u8; 15], length: u8 },
-    Borrowed(&'a [u8]),
-}
-
-impl<'a> EventKey<'a> {
-    fn new(value: &'a [u8]) -> Self {
-        if value.len() <= 15 {
-            let mut bytes = [0; 15];
-            bytes[..value.len()].copy_from_slice(value);
-            Self::Inline {
-                bytes,
-                length: value.len() as u8,
-            }
-        } else {
-            Self::Borrowed(value)
-        }
-    }
-
-    fn bytes(&self) -> &[u8] {
-        match self {
-            Self::Inline { bytes, length } => &bytes[..*length as usize],
-            Self::Borrowed(bytes) => bytes,
-        }
-    }
-}
-
-impl Hash for EventKey<'_> {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.bytes().hash(state);
-    }
-}
-
-impl PartialEq for EventKey<'_> {
-    fn eq(&self, other: &Self) -> bool {
-        self.bytes() == other.bytes()
-    }
-}
-
-impl Eq for EventKey<'_> {}
-
-#[derive(Clone, Copy)]
-struct Event<'a> {
-    id: EventKey<'a>,
-    person: u32,
-    ts: i64,
-    ingest: i64,
-    revenue: u32,
-    category: u32,
-}
-
-#[derive(Clone, Copy)]
 struct PersonEvent {
-    person: u32,
+    person: u64,
     ts: i64,
     revenue: u32,
     category: u32,
 }
 
 struct Click<'a> {
-    person: u32,
+    person: u64,
     id: &'a [u8],
     ts: i64,
     campaign: u32,
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct CampaignStats {
     sessions: i64,
     purchasing_sessions: i64,
     revenue: i64,
     assists: i64,
+}
+
+impl CampaignStats {
+    fn add(&mut self, other: Self) {
+        self.sessions += other.sessions;
+        self.purchasing_sessions += other.purchasing_sessions;
+        self.revenue += other.revenue;
+        self.assists += other.assists;
+    }
+}
+
+// A short manifest window permits direct indexing for both credit and assists.
+// Keep a sparse representation when the date range or catalog is large.
+enum DailyCampaigns {
+    Dense {
+        first_day: i32,
+        width: usize,
+        cells: Vec<CampaignStats>,
+    },
+    Sparse(CampaignTotals),
+}
+
+impl DailyCampaigns {
+    fn new(context: &Context) -> Self {
+        let first_day = context.start.div_euclid(DAY);
+        let days = (context.end - 1).div_euclid(DAY) - first_day + 1;
+        let width = context.dimensions.campaign_names.len();
+        match (days as usize).checked_mul(width) {
+            Some(size) if size <= 131072 => Self::Dense {
+                first_day: first_day as i32,
+                width,
+                cells: vec![CampaignStats::default(); size],
+            },
+            _ => Self::Sparse(CampaignTotals::new()),
+        }
+    }
+
+    fn record(&mut self, day: i32, campaign: u32, revenue: i64, assists: &[u32]) {
+        let credited = match self {
+            Self::Dense {
+                first_day,
+                width,
+                cells,
+            } => {
+                let begin = (day - *first_day) as usize * *width;
+                let daily = &mut cells[begin..begin + *width];
+                for &assist in assists {
+                    daily[assist as usize].assists += 1;
+                }
+                &mut daily[campaign as usize]
+            }
+            Self::Sparse(totals) => {
+                for &assist in assists {
+                    totals.entry((assist, day)).or_default().assists += 1;
+                }
+                totals.entry((campaign, day)).or_default()
+            }
+        };
+        credited.sessions += 1;
+        credited.purchasing_sessions += i64::from(revenue > 0);
+        credited.revenue += revenue;
+    }
+
+    fn merge(mut self, other: Self) -> Self {
+        match (&mut self, other) {
+            (Self::Dense { cells: left, .. }, Self::Dense { cells: right, .. }) => {
+                for (a, b) in left.iter_mut().zip(right) {
+                    a.add(b);
+                }
+            }
+            (Self::Sparse(left), Self::Sparse(right)) => {
+                for (key, stats) in right {
+                    left.entry(key).or_default().add(stats);
+                }
+            }
+            _ => unreachable!("all shards share one manifest and catalog"),
+        }
+        self
+    }
+
+    fn into_totals(self) -> CampaignTotals {
+        match self {
+            Self::Dense {
+                first_day,
+                width,
+                cells,
+            } => cells
+                .chunks(width)
+                .enumerate()
+                .flat_map(|(offset, day)| {
+                    day.iter()
+                        .copied()
+                        .enumerate()
+                        .filter(|(_, c)| c.sessions != 0 || c.assists != 0)
+                        .map(move |(campaign, c)| ((campaign as u32, first_day + offset as i32), c))
+                })
+                .collect(),
+            Self::Sparse(totals) => totals,
+        }
+    }
 }
 
 struct Context {
@@ -106,11 +153,11 @@ struct Context {
 }
 
 impl Context {
-    fn person(&self, user: &[u8]) -> u32 {
-        self.people.ids.get(user).copied().unwrap_or(u32::MAX)
+    fn person(&self, user: &[u8]) -> u64 {
+        self.people.resolve(user)
     }
 
-    fn person_shard(&self, person: u32) -> usize {
+    fn person_shard(&self, person: u64) -> usize {
         self.hash.hash_one(person) as usize & (self.person_shards - 1)
     }
 }
@@ -138,133 +185,6 @@ fn flatten<T>(parts: Vec<Vec<T>>) -> Vec<T> {
         result.append(&mut part);
     }
     result
-}
-
-fn read_events<'a>(input: &'a Inputs, context: &Context) -> Vec<Vec<Vec<Event<'a>>>> {
-    let chunks = input.chunks();
-    let groups: Vec<_> = chunks
-        .par_chunks(16)
-        .map(|chunks| {
-            let mut groups = buckets(context.event_shards);
-            for &chunk in chunks {
-                for line in lines(chunk) {
-                    let Some([id, user, ts, ingest, kind, product, price]) = fields::<7>(line)
-                    else {
-                        continue;
-                    };
-                    if id.is_empty() {
-                        continue;
-                    }
-                    let ingest = timestamp(ingest).expect("ingest_ts must be valid F1");
-                    let purchase = kind == b"purchase";
-                    let revenue = if purchase {
-                        unsigned(price)
-                            .filter(|&price| (1..=10_000_000).contains(&price))
-                            .unwrap_or(0) as u32
-                    } else {
-                        0
-                    };
-                    let valid = !user.is_empty()
-                        && !product.is_empty()
-                        && (kind == b"view" || kind == b"cart" || (purchase && revenue > 0));
-                    let ts = timestamp(ts)
-                        .filter(|&ts| valid && ts >= context.start && ts < context.end)
-                        .unwrap_or(i64::MIN);
-                    let category = if revenue > 0 {
-                        *context
-                            .dimensions
-                            .products
-                            .get(product)
-                            .unwrap_or(&context.dimensions.unknown)
-                    } else {
-                        context.dimensions.unknown
-                    };
-                    let hash = context.hash.hash_one(id);
-                    let shard = hash as usize & (context.event_shards - 1);
-                    // Validation is recorded here, but invalid records remain until
-                    // global event_id deduplication chooses the earliest ingestion.
-                    groups[shard].push(Event {
-                        id: EventKey::new(id),
-                        person: context.person(user),
-                        ts,
-                        ingest,
-                        revenue,
-                        category,
-                    });
-                }
-            }
-            groups
-        })
-        .collect();
-    transpose(groups, context.event_shards)
-}
-
-fn deduplicate<'a>(parts: Vec<Vec<Event<'a>>>, context: &Context) -> Vec<Vec<PersonEvent>> {
-    let count: usize = parts.iter().map(Vec::len).sum();
-    let mut earliest: AHashMap<EventKey<'a>, Event<'a>> = AHashMap::with_capacity(count);
-    for part in parts {
-        for event in part {
-            match earliest.entry(event.id) {
-                Entry::Vacant(entry) => {
-                    entry.insert(event);
-                }
-                Entry::Occupied(mut entry) => {
-                    if event.ingest < entry.get().ingest {
-                        entry.insert(event);
-                    }
-                }
-            }
-        }
-    }
-    let mut groups = buckets(context.person_shards);
-    for (_, event) in earliest {
-        if event.ts != i64::MIN && event.ingest - event.ts <= DAY {
-            groups[context.person_shard(event.person)].push(PersonEvent {
-                person: event.person,
-                ts: event.ts,
-                revenue: event.revenue,
-                category: event.category,
-            });
-        }
-    }
-    groups
-}
-
-fn read_clicks<'a>(input: &'a Inputs, context: &Context) -> Vec<Vec<Vec<Click<'a>>>> {
-    let chunks = input.chunks();
-    let groups: Vec<_> = chunks
-        .par_chunks(16)
-        .map(|chunks| {
-            let mut groups = buckets(context.person_shards);
-            for &chunk in chunks {
-                for line in lines(chunk) {
-                    let Some([id, user, campaign, ts]) = fields::<4>(line) else {
-                        continue;
-                    };
-                    if id.is_empty() || user.is_empty() {
-                        continue;
-                    }
-                    let Some(&campaign) = context.dimensions.campaigns.get(campaign) else {
-                        continue;
-                    };
-                    let Some(ts) =
-                        timestamp(ts).filter(|&ts| ts >= context.start - WEEK && ts < context.end)
-                    else {
-                        continue;
-                    };
-                    let person = context.person(user);
-                    groups[context.person_shard(person)].push(Click {
-                        person,
-                        id,
-                        ts,
-                        campaign,
-                    });
-                }
-            }
-            groups
-        })
-        .collect();
-    transpose(groups, context.person_shards)
 }
 
 struct Attribution {
@@ -333,7 +253,11 @@ impl Attribution {
     }
 }
 
-fn finish_day<'a>(rows: &mut Vec<UserDay<'a>>, mut row: UserDay<'a>, categories: &mut [i64]) {
+fn finish_day(rows: &mut Vec<UserDay>, mut row: UserDay, categories: &mut [i64]) {
+    if row.revenue == 0 {
+        rows.push(row);
+        return;
+    }
     let mut highest = 0;
     // Category indices are assigned in byte order, so the first maximum wins.
     for (index, revenue) in categories.iter_mut().enumerate() {
@@ -351,7 +275,7 @@ fn process_people(
     clicks: Vec<Vec<Click<'_>>>,
     shard: usize,
     context: &Context,
-) -> Result<CampaignTotals> {
+) -> Result<DailyCampaigns> {
     let mut events = flatten(events);
     let mut clicks = flatten(clicks);
     events.sort_unstable_by(|a, b| a.person.cmp(&b.person).then(a.ts.cmp(&b.ts)));
@@ -359,12 +283,12 @@ fn process_people(
         a.person
             .cmp(&b.person)
             .then(a.ts.cmp(&b.ts))
-            .then(a.id.cmp(b.id))
+            .then_with(|| a.id.cmp(b.id))
     });
     // Copies are identical after CSV parsing. They are adjacent in this order.
     clicks.dedup_by(|a, b| a.person == b.person && a.ts == b.ts && a.id == b.id);
     let mut rows = Vec::new();
-    let mut totals = CampaignTotals::new();
+    let mut totals = DailyCampaigns::new(context);
     let mut categories = vec![0i64; context.dimensions.categories.len()];
     let mut attribution = Attribution::new(context.dimensions.campaign_names.len());
     let mut click_at = 0;
@@ -379,7 +303,7 @@ fn process_people(
         }
         let person_clicks = &clicks[first_click..click_at];
         attribution.reset();
-        let mut current: Option<UserDay<'_>> = None;
+        let mut current: Option<UserDay> = None;
         let mut at = 0;
         while at < person_events.len() {
             let first = at;
@@ -395,7 +319,7 @@ fn process_people(
                 finish_day(&mut rows, current.take().unwrap(), &mut categories);
             }
             let row = current.get_or_insert(UserDay {
-                person: &context.people.names[person as usize],
+                person,
                 day,
                 sessions: 0,
                 events: 0,
@@ -404,20 +328,16 @@ fn process_people(
             });
             let mut revenue = 0i64;
             for event in &person_events[first..at] {
-                revenue += event.revenue as i64;
-                categories[event.category as usize] += event.revenue as i64;
+                if event.revenue != 0 {
+                    revenue += event.revenue as i64;
+                    categories[event.category as usize] += event.revenue as i64;
+                }
             }
             row.sessions += 1;
             row.events += (at - first) as i64;
             row.revenue += revenue;
             let campaign = attribution.advance(person_clicks, start, context.dimensions.organic);
-            let stats = totals.entry((campaign, day)).or_default();
-            stats.sessions += 1;
-            stats.purchasing_sessions += i64::from(revenue > 0);
-            stats.revenue += revenue;
-            for &campaign in &attribution.active {
-                totals.entry((campaign, day)).or_default().assists += 1;
-            }
+            totals.record(day, campaign, revenue, &attribution.active);
         }
         if let Some(row) = current {
             finish_day(&mut rows, row, &mut categories);
@@ -429,6 +349,7 @@ fn process_people(
             .join("user_daily")
             .join(format!("part-{shard:03}.parquet")),
         &rows,
+        &context.people,
         &context.dimensions,
     )?;
     Ok(totals)
@@ -470,7 +391,7 @@ fn run() -> Result<()> {
     let clicks = Inputs::open(&data.join("clicks"))?;
     let small = events.bytes() < 1024 * 1024;
     let context = Context {
-        people: People::load(&links, &events, &clicks),
+        people: People::new(),
         dimensions: Dimensions::load(&data)?,
         start,
         end,
@@ -478,44 +399,36 @@ fn run() -> Result<()> {
         person_shards: if small {
             1
         } else {
-            (threads * 8).next_power_of_two().min(128)
+            (threads * 4).next_power_of_two().min(128)
         },
-        event_shards: if small { 1 } else { 256 },
+        event_shards: if small { 1 } else { 128 },
         output,
     };
-    eprintln!(
-        "identity and lookups {:.3}s; user IDs {}",
-        started.elapsed().as_secs_f64(),
-        context.people.ids.len()
+    let (raw, ()) = rayon::join(
+        || ingest::scan_events(&events, &context),
+        || context.people.load_links(&links),
     );
-    let raw = read_events(&events, &context);
-    eprintln!("parsed events {:.3}s", started.elapsed().as_secs_f64());
-    let groups: Vec<_> = raw
-        .into_par_iter()
-        .map(|parts| deduplicate(parts, &context))
-        .collect();
-    let events_by_person = transpose(groups, context.person_shards);
     eprintln!(
-        "deduplicated events {:.3}s",
+        "events and links {:.3}s; aliases {}",
+        started.elapsed().as_secs_f64(),
+        context.people.len()
+    );
+    let (events_by_person, clicks_by_person) = rayon::join(
+        || ingest::finish_events(raw, &context),
+        || ingest::clicks(&clicks, &context),
+    );
+    eprintln!(
+        "deduplication and clicks {:.3}s",
         started.elapsed().as_secs_f64()
     );
-    let clicks_by_person = read_clicks(&clicks, &context);
-    eprintln!("parsed clicks {:.3}s", started.elapsed().as_secs_f64());
     let totals = events_by_person
         .into_par_iter()
         .zip(clicks_by_person)
         .enumerate()
         .map(|(shard, (events, clicks))| process_people(events, clicks, shard, &context))
-        .try_reduce(CampaignTotals::new, |mut left, right| {
-            for (key, value) in right {
-                let stats = left.entry(key).or_default();
-                stats.sessions += value.sessions;
-                stats.purchasing_sessions += value.purchasing_sessions;
-                stats.revenue += value.revenue;
-                stats.assists += value.assists;
-            }
-            Ok(left)
-        })?;
+        .try_reduce_with(|left, right| Ok(left.merge(right)))
+        .expect("at least one person shard")?
+        .into_totals();
     output::campaigns(
         &context.output.join("campaign_daily/part-000.parquet"),
         &totals,
@@ -534,29 +447,5 @@ fn main() {
     if let Err(error) = run() {
         eprintln!("shopping-sessions: {error}");
         std::process::exit(1);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn compact_event_ids_preserve_full_values() {
-        let values: [&[u8]; 5] = [
-            b"event-a",
-            b"event-a\0",
-            b"123456789012345",
-            b"1234567890123456",
-            b"1234567890123457",
-        ];
-        let mut table = AHashMap::new();
-        for (index, value) in values.iter().enumerate() {
-            table.insert(EventKey::new(value), index);
-        }
-        assert_eq!(table.len(), values.len());
-        for (index, value) in values.iter().enumerate() {
-            assert_eq!(table[&EventKey::new(value)], index);
-        }
     }
 }
