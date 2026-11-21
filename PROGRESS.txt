@@ -7,15 +7,37 @@ Submission and targets
 [x] Publish 36e2f49. The team reported 1.52 seconds on the practice portal.
 [x] Publish b45f23d. The team reported 1.17 seconds on the practice portal.
 [x] Publish 9a8f5a0. The team reported 1.08 seconds on the practice portal.
+[x] Submit b86512b. The team reported 1.05 seconds on the practice portal.
+    This saves 30 ms (2.8%). Reaching 0.500 s requires another 550 ms,
+    or a 2.10x speedup from this result.
 [ ] Reach a 20M local container start-to-exit median below 1.000 second.
     Current 20M warm medians are 1.471, 1.514 and 1.440 s on this machine.
 [ ] Beat 0.500 s on the next portal submission. Longer-term target: 0.300 s.
+
+Critical-path measurements from b86512b
+[x] Time two 20M inputs with 5M clicks, four interleaved warm containers
+    per input. The current solver reached the end of event routing and click
+    ingestion at 0.883 and 0.885 s (median). Aggregation and Parquet output
+    then took another 0.304 and 0.310 s on the local host.
+[x] Compare retaining source event buffers on two 20M inputs. Median container
+    time fell from 1.546 to 1.356 s on seed 46091337 and from 1.200 to
+    1.174 s on seed 73. Isolating link parsing on two of eight workers helped
+    on the first input and lost time on the second.
+[x] Test a parallel identity graph, a one-pass event-ID table and a second
+    in-place compaction strategy on the same two seeds. Four warm containers
+    per image and seed gave the following local start-to-exit medians.
+    Variant                           46091337      73
+    b86512b                            1.320 s   1.187 s
+    Parallel identity graph            1.282 s   1.172 s
+    Single-pass event-ID table         1.484 s   1.320 s
+    Bidirectional compaction           1.250 s   1.225 s
+    All three together                 1.427 s   1.282 s
 
 [x] Publish b86512b on perf/worker-reuse. All 36 official fixtures and 13
     reference datasets matched, as did all rows on three 20M inputs and one
     60M input. At 60M the median of three fresh, 6 GiB containers fell from
     7.536 to 6.243 s, with a 19.591 s first run for the candidate. Practice
-    gains varied by seed and trial. Its portal time is unmeasured.
+    gains varied by seed and trial. Its measured portal time is 1.05 s.
 [x] Confirm the choice on a new 20M-event, 5M-click input (seed 46091337).
     Four fresh containers per build after warmup: median 1.308 s for the
     scored 9a8f5a0 and 1.243 s for b86512b. All 2,230,398 user/day and
