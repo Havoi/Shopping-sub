@@ -71,7 +71,7 @@ class Writer {
     std::ofstream stream;
     std::span<const Field> schema;
     std::vector<Group> groups;
-    std::vector<char> compressed;
+    std::vector<char> compressed, runValues, runIndices;
     std::vector<int64_t> widened;
     std::string header, values, levels, combined, indices;
     uint64_t written = 0, totalRows = 0;
@@ -207,10 +207,15 @@ public:
             fallback();
             return;
         }
-        values.resize(n * 13);
-        char *p = values.data();
-        combined.clear();
-        combined.push_back(16);
+        // These buffers are independent of the nullable category scratch.
+        // Keeping their high-water marks avoids zeroing a full row group
+        // each time we encode its much shorter dictionary of distinct users.
+        const size_t maxRuns = std::min(n, keys.size() - run);
+        if (runValues.size() < maxRuns * 13) runValues.resize(maxRuns * 13);
+        if (runIndices.size() < 1 + maxRuns * 5) runIndices.resize(1 + maxRuns * 5);
+        char *p = runValues.data();
+        char *indicesOut = runIndices.data();
+        *indicesOut++ = 16;
         size_t distinct = 0, remaining = n;
         while (remaining) {
             const Key &k = keys[run];
@@ -243,13 +248,43 @@ public:
                 ++run;
                 consumed = 0;
             }
-            varint(combined, count * 2);
+            uint32_t length = static_cast<uint32_t>(count * 2);
+            while (length >= 128) {
+                *indicesOut++ = static_cast<char>(length | 128);
+                length >>= 7;
+            }
+            *indicesOut++ = static_cast<char>(length);
             const uint16_t index = distinct++;
-            combined.append(reinterpret_cast<const char *>(&index), 2);
+            std::memcpy(indicesOut, &index, 2);
+            indicesOut += 2;
         }
         auto &c = column();
-        page(c, {values.data(), static_cast<size_t>(p - values.data())}, distinct, plain, true);
-        page(c, combined, n, 8);
+        page(c, {runValues.data(), static_cast<size_t>(p - runValues.data())}, distinct, plain, true);
+        page(c, {runIndices.data(), static_cast<size_t>(indicesOut - runIndices.data())}, n, 8);
+    }
+    // Directly pack eight 32-bit dictionary ordinals into Parquet's
+    // little-endian fixed-width group without a byte-per-row intermediate.
+    template<unsigned Width, class T>
+    static void packOrdinals(const T* src, size_t n, uint32_t base, char* dst) {
+        static_assert(sizeof(T) == 4 && Width > 0 && Width <= 8);
+        constexpr uint64_t mask = 0x0101010101010101ULL * ((1u << Width) - 1);
+        const auto origin = _mm256_set1_epi32(static_cast<int32_t>(base));
+        const auto gather = _mm256_setr_epi8(0,4,8,12,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                                             0,4,8,12,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1);
+        size_t row = 0;
+        for (; row + 8 <= n; row += 8, dst += Width) {
+            const auto values = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + row));
+            const auto bytes = _mm256_shuffle_epi8(_mm256_sub_epi32(values,origin),gather);
+            const auto eight = _mm_unpacklo_epi32(_mm256_castsi256_si128(bytes),_mm256_extracti128_si256(bytes,1));
+            const uint64_t packed = _pext_u64(static_cast<uint64_t>(_mm_cvtsi128_si64(eight)),mask);
+            std::memcpy(dst, &packed, Width);
+        }
+        if (row < n) {
+            uint64_t packed = 0;
+            for (unsigned j = 0; row + j < n; ++j)
+                packed |= uint64_t(uint32_t(src[row+j])-base) << (j * Width);
+            std::memcpy(dst, &packed, Width);
+        }
     }
     template<unsigned Width> void smallCountPage(const uint32_t *src, size_t n, uint32_t largest) {
         std::array<int64_t, 64> dictionary;
@@ -264,16 +299,7 @@ public:
         varint(combined, (groups << 1) | 1);
         const size_t header = combined.size();
         combined.resize(header + groups * Width);
-        indices.resize(groups * 8);
-        bytePlane<uint32_t, 0>(src, indices.data(), n);
-        std::memset(indices.data() + n, 0, groups * 8 - n);
-        constexpr uint64_t mask = 0x0101010101010101ULL * ((1u << Width) - 1);
-        for (size_t j = 0; j < groups; ++j) {
-            uint64_t eight;
-            std::memcpy(&eight, indices.data() + 8 * j, 8);
-            const uint64_t packed = _pext_u64(eight, mask);
-            std::memcpy(combined.data() + header + Width * j, &packed, Width);
-        }
+        packOrdinals<Width>(src,n,0,combined.data() + header);
         page(c, combined, n, 8);
     }
 
@@ -369,16 +395,7 @@ public:
         varint(combined, (groups << 1) | 1);
         const size_t headerBytes = combined.size();
         combined.resize(headerBytes + 4 * groups);
-        indices.resize(groups * 8);
-        for (size_t j = 0; j < n; ++j)
-            indices[j] = static_cast<char>(uint32_t(src[j]) - uint32_t(low));
-        std::memset(indices.data() + n, 0, groups * 8 - n);
-        for (size_t j = 0; j < groups; ++j) {
-            uint64_t eight;
-            std::memcpy(&eight, indices.data() + j * 8, 8);
-            const uint32_t packed = static_cast<uint32_t>(_pext_u64(eight, 0x0f0f0f0f0f0f0f0fULL));
-            std::memcpy(combined.data() + headerBytes + 4 * j, &packed, 4);
-        }
+        packOrdinals<4>(src,n,uint32_t(low),combined.data() + headerBytes);
         page(c, combined, n, 8);
     }
     void counts64(const uint32_t *src, size_t n) {

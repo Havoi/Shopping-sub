@@ -19,14 +19,17 @@ int main() {
     std::vector<std::unique_ptr<Reader>> readers;
     readers.push_back(std::make_unique<Reader>(1, 1));
     readers.push_back(std::make_unique<Reader>(1, 1));
-    auto valid = [&](size_t r, Key id, int64_t arrival) {
+    auto order = [](unsigned second) -> uint64_t {
+        return (second / 10) * 16 + second % 10;
+    };
+    auto valid = [&](size_t r, Key id, unsigned arrival) {
         Reader& reader = *readers[r];
         const uint32_t index = reader.events.add(0, Event::pack(Key::from("buyer"), 0, {1, 0, 0}));
-        reader.ids.add(0, {id, location(reader, arrival, 0, 0, index)});
+        reader.ids.add(0, {id, location(reader, ParsedEvent{.order = order(arrival)}, 0, 0, index)});
         return index;
     };
-    auto invalid = [&](size_t r, Key id, int64_t arrival) {
-        readers[r]->ids.add(0, {id, (relativeArrival(arrival, 0) << 32) | invalidArrivalTag});
+    auto invalid = [&](size_t r, Key id, unsigned arrival) {
+        readers[r]->ids.add(0, {id, (order(arrival) << 32) | invalidArrivalTag});
     };
     auto alive = [&](size_t r, uint32_t index) {
         return !readers[r]->events.at(0, index).person.empty();

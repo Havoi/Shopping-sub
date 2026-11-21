@@ -6,30 +6,24 @@
 int main() {
     Reader reader(256, 1);
     Source source;
-    constexpr int64_t half = int64_t{1} << 31;
-    const std::array<int64_t, 7> origins{
-        INT64_MIN + half, INT64_MIN + half + 1, -half, 0, half,
-        INT64_MAX - INT32_MAX - 1, INT64_MAX - INT32_MAX
-    };
-    const std::array<int64_t, 10> arrivals{
-        INT64_MIN, INT64_MIN + 1, INT64_MAX, INT64_MAX - 1,
-        -half - 1, -half, half - 1, half, 0, 1
-    };
-
-    for (uint32_t bucket = 0; bucket < 1024; ++bucket) {
-        for (int64_t origin : origins) {
-            for (int64_t value : arrivals) {
+    for (int64_t start : {-dayMs, int64_t(0), 20000 * dayMs}) {
+        const int64_t origin = orderOrigin(start);
+        // Distinct days and the last valid clock exercise both parts of the rank.
+        for (uint64_t rank : {uint64_t(0), uint64_t(0x235959), uint64_t(1023) * clockStride + 0x235959,
+                              missingOrder}) {
+            const int64_t time = rank == missingOrder ? INT64_MAX : decodeOrder(rank, origin);
+            ParsedEvent row{.order = rank, .arrival = time};
+            for (uint32_t bucket : {0u, 1u, 511u, 1023u}) {
                 for (uint32_t index : {0u, indexLimit - 1, indexLimit, UINT32_MAX}) {
-                    uint64_t info = location(reader, value, origin, bucket, index);
-                    assert(arrival(info, reader, source, origin) == value);
-                    const __int128 delta = __int128(value) - origin;
-                    bool fits = delta >= -half && delta < half && index < indexLimit;
+                    const uint64_t info = location(reader, row, origin, bucket, index);
+                    assert(arrival(info, reader, source, origin) == time);
+                    const bool fits = rank != missingOrder && index < indexLimit;
                     assert((uint32_t(info) < sourceTag) == fits);
                     if (fits) {
                         assert((uint32_t(info) >> indexBits) == bucket);
                         assert((info & (indexLimit - 1)) == index);
                     } else {
-                        const Extended& extended = reader.slow[specialValue(info)];
+                        const auto& extended = reader.slow.at(specialValue(info));
                         assert(extended.bucket == bucket && extended.index == index);
                     }
                 }

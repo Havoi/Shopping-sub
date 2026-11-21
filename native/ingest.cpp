@@ -66,17 +66,24 @@ inline bool hourTooLarge(const char *hour) {
     return days * dayMs;
 }
 
-inline int64_t midnight(const char* p) {
-    struct Entry { uint64_t digits; int64_t ms = invalidTime; };
-    static thread_local std::array<Entry,64> cache{};
+struct DateEntry { uint64_t digits; int64_t ms = invalidTime; int64_t rank = 0; };
+constexpr int64_t clockStride = int64_t{1} << 22;
+inline const DateEntry& dateEntry(const char* p) {
+    static thread_local std::array<DateEntry,64> cache{};
     const auto data = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p));
     const auto packed = _mm_shuffle_epi8(data,
         _mm_setr_epi8(0,1,2,3,5,6,8,9,-1,-1,-1,-1,-1,-1,-1,-1));
     const uint64_t digits = _mm_cvtsi128_si64(packed);
     const unsigned slot = ((uint8_t(p[8]) & 3) << 4) | (uint8_t(p[9]) & 15);
     auto& entry = cache[slot];
-    if (entry.digits != digits) entry = {digits, calendarMidnight(p)};
-    return entry.ms;
+    if (entry.digits != digits) {
+        const int64_t ms = calendarMidnight(p);
+        entry = {digits, ms, (ms / dayMs) * clockStride};
+    }
+    return entry;
+}
+inline int64_t midnight(const char* p) {
+    return dateEntry(p).ms;
 }
 
 // Convert all three clock pairs in one vector. For untrusted event times
@@ -360,18 +367,6 @@ uint64_t special(uint64_t value, uint32_t tag) {
 uint64_t specialValue(uint64_t info) {
     return (info >> 32) | ((info & 0x1fffffffu) << 32);
 }
-uint64_t relativeArrival(int64_t arrival, int64_t origin) {
-    return uint64_t(arrival) - uint64_t(origin) + (uint64_t{1} << 31);
-}
-uint64_t location(Reader& reader, int64_t arrival, int64_t origin, uint32_t bucket, uint32_t index) {
-    const uint64_t relative = relativeArrival(arrival,origin);
-    if (relative <= UINT32_MAX && index < indexLimit)
-        return (relative << 32) | (bucket << indexBits) | index;
-    const auto offset = reader.slow.size();
-    reader.slow.push_back({arrival,bucket,index});
-    return special(offset,slowTag);
-}
-
 struct Router {
     Slab slab;
     Scatter<Event, 16> events;
@@ -380,6 +375,7 @@ struct Router {
 };
 
 struct ParsedEvent {
+    uint64_t order;
     Key id;
     bool valid = false;
     int64_t arrival;
@@ -387,33 +383,99 @@ struct ParsedEvent {
     EventData row;
 };
 
-// HH:MM:SS fits in eight bytes. Decode both clocks as six decimal pairs in
-// one SIMD register. The event clock is untrusted, whereas a twenty-byte
-// ingest field has the same input guarantee used by validIngest.
-inline bool pairedClocks(const char* event, const char* ingest,
-                         int& eventSeconds, int& ingestSeconds) {
-    const auto a = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(event));
-    const auto b = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(ingest));
-    const auto raw = _mm_unpacklo_epi64(a,b);
-    const auto digits = _mm_sub_epi8(raw,_mm_set1_epi64x(0x30303a30303a3030LL));
-    const auto excess = _mm_subs_epu8(digits,_mm_set_epi64x(-1,0x0905000905000902LL));
-    if (!_mm_testz_si128(excess, excess) || hourTooLarge(event))
-        return false;
-    const auto packed = _mm_shuffle_epi8(digits,
-        _mm_setr_epi8(0,1,3,4,6,7,-1,-1,8,9,11,12,14,15,-1,-1));
-    const auto pairs = _mm_maddubs_epi16(packed,_mm_set1_epi16(0x010a));
-    const auto sums = _mm_madd_epi16(pairs,_mm_setr_epi16(3600,60,1,0,3600,60,1,0));
-    const auto seconds = _mm_add_epi32(sums,_mm_srli_si128(sums,4));
-    eventSeconds = _mm_cvtsi128_si32(seconds);
-    ingestSeconds = _mm_extract_epi32(seconds,2);
-    return true;
+// The specification guarantees that ingest_ts is a valid UTC F1 value.
+// A chronological day plus the six packed clock digits sorts exactly like
+// its Unix timestamp. Decode the clock only for a real 24-hour boundary or
+// a rare comparison between compact and full-width arrival representations.
+inline uint32_t clockDigits(const char* clock) {
+    uint64_t hms;
+    std::memcpy(&hms,clock,8);
+    return static_cast<uint32_t>(_pext_u64(__builtin_bswap64(hms), 0x0f0f000f0f000f0fULL));
+}
+inline int64_t orderOrigin(int64_t start) {
+    return (start / dayMs - 512) * clockStride;
+}
+inline int64_t decodeOrder(uint32_t order, int64_t origin) {
+    const int h = ((order >> 20) & 3) * 10 + ((order >> 16) & 15);
+    const int m = ((order >> 12) & 15) * 10 + ((order >> 8) & 15);
+    const int sec = ((order >> 4) & 15) * 10 + (order & 15);
+    return ((origin >> 22) + (order >> 22)) * dayMs +
+           (3600LL * h + 60 * m + sec) * 1000;
+}
+constexpr uint64_t missingOrder = UINT64_MAX;
+static thread_local int64_t readerOrderOrigin;
+
+inline uint64_t location(Reader& reader, const ParsedEvent& event, int64_t origin,
+                         uint32_t bucket, uint32_t index) {
+    if (event.order != missingOrder && index < indexLimit)
+        return (event.order << 32) | (bucket << indexBits) | index;
+    const int64_t time = event.order == missingOrder ? event.arrival : decodeOrder(event.order,origin);
+    const size_t position = reader.slow.size();
+    reader.slow.push_back({time,bucket,index});
+    return special(position,slowTag);
 }
 
+inline void rankArrival(const char* text, ParsedEvent& out) {
+    const auto& date = dateEntry(text);
+    const auto rank = static_cast<uint64_t>(date.rank - readerOrderOrigin + clockDigits(text+11));
+    if (rank <= UINT32_MAX) out.order = rank;
+    else out.arrival = date.ms + 1000LL * clockSeconds<false>(text+11);
+}
+
+// The two timestamp formats have fixed punctuation. Validate each complete
+// clock and, for F2, the UTC offset in a single register. The date cache
+// validates the year and the Gregorian month/day combination.
+template<bool Offset>
+inline int isoEventSeconds(const char* p) {
+    __m128i parts;
+    if constexpr (Offset) {
+        // Bytes 9..24 contain the local clock and the entire numeric offset.
+        const auto raw = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p+9));
+        const auto digits = _mm_sub_epi8(raw, _mm_setr_epi8(
+            '0','T','0','0',':','0','0',':','0','0',0,'0','0',':','0','0'));
+        const auto excess = _mm_subs_epu8(digits, _mm_setr_epi8(
+            9,0,2,9,0,5,9,0,5,9,-1,2,9,0,5,9));
+        if (!_mm_testz_si128(excess,excess) || p[7]!='-' ||
+            (p[19]!='+' && p[19]!='-') || hourTooLarge(p+11) || hourTooLarge(p+20))
+            return INT_MIN;
+        parts = _mm_shuffle_epi8(digits, _mm_setr_epi8(
+            2,3,5,6,8,9,-1,-1,11,12,14,15,-1,-1,-1,-1));
+    } else {
+        const auto raw = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p+4));
+        const auto digits = _mm_sub_epi8(raw, _mm_setr_epi8(
+            '-','0','0','-','0','0','T','0','0',':','0','0',':','0','0','Z'));
+        const auto excess = _mm_subs_epu8(digits, _mm_setr_epi8(
+            0,9,9,0,9,9,0,2,9,0,5,9,0,5,9,0));
+        if (!_mm_testz_si128(excess,excess) || hourTooLarge(p+11)) return INT_MIN;
+        parts = _mm_shuffle_epi8(digits, _mm_setr_epi8(
+            7,8,10,11,13,14,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1));
+    }
+    const auto pairs = _mm_maddubs_epi16(parts, _mm_set1_epi16(0x010a));
+    const auto seconds = _mm_madd_epi16(pairs, _mm_setr_epi16(3600,60,1,0,3600,60,0,0));
+    const int local = _mm_cvtsi128_si32(_mm_add_epi32(seconds,_mm_srli_si128(seconds,4)));
+    if constexpr (Offset) {
+        const int zone = _mm_extract_epi32(seconds,2);
+        return p[19]=='+' ? local-zone : local+zone;
+    }
+    return local;
+}
 [[gnu::always_inline]] inline bool eventTimes(std::string_view event, std::string_view arrival,
-                                              const Context &ctx, int64_t &ts, int64_t &ingest) {
+                                              const Context &ctx, int64_t &ts, ParsedEvent &out) {
     const char* e = event.data();
     const char* a = arrival.data();
-    if (event.size() == 13 && arrival.size() == 20) {
+    if (arrival.size() != 20) {
+        ts = timestamp(event);
+        out.arrival = timestamp(arrival);
+        return ts >= ctx.start && ts < ctx.end && out.arrival != invalidTime &&
+               out.arrival - dayMs <= ts;
+    }
+    // Take copies since resolving a different event month can replace the
+    // same thread-local cache slot.
+    const auto ad = dateEntry(a);
+    const auto rank = static_cast<uint64_t>(ad.rank - readerOrderOrigin + clockDigits(a+11));
+    if (rank <= UINT32_MAX) out.order = rank;
+    else out.arrival = ad.ms + 1000LL * clockSeconds<false>(a+11);
+    if (event.size() == 13) {
         // There are at least three more bytes in this CSV row beyond the epoch field.
         const auto raw = _mm_loadu_si128(reinterpret_cast<const __m128i *>(e));
         const auto digits = _mm_sub_epi8(raw, _mm_set1_epi8('0'));
@@ -425,39 +487,20 @@ inline bool pairedClocks(const char* event, const char* ingest,
         const auto quads = _mm_madd_epi16(pairs, _mm_set1_epi32(0x00010064));
         const auto chunks = _mm_madd_epi16(_mm_packs_epi32(quads, quads), _mm_set1_epi32(0x00012710));
         ts = int64_t(_mm_cvtsi128_si32(chunks)) * 100000000 + _mm_extract_epi32(chunks, 1);
-        if (ts < ctx.start || ts >= ctx.end)
-            return false;
-        ingest = validIngest(a);
-        return ingest - dayMs <= ts;
-    }
-    if (arrival.size() == 20 && (event.size() == 20 || event.size() == 25) && e[4]=='-') {
-        if (e[7]!='-' || e[10]!='T') return false;
-        int offset = 0;
-        if (event.size() == 20) {
-            if (e[19]!='Z') return false;
-        } else {
-            if ((e[19]!='+' && e[19]!='-') || e[22]!=':' || !digit(e[20]) ||
-                !digit(e[21]) || !digit(e[23]) || !digit(e[24])) return false;
-            int h=pairValue(e+20), m=pairValue(e+23);
-            if (h>23 || m>59) return false;
-            offset=(e[19]=='+'?1:-1)*(3600*h+60*m);
-        }
-        int eventSeconds, ingestSeconds;
-        if (!pairedClocks(e+11,a+11,eventSeconds,ingestSeconds)) return false;
-        const auto date = midnight(e);
+    } else if ((event.size() == 20 || event.size() == 25) && e[4] == '-') {
+        const int seconds = event.size() == 20 ? isoEventSeconds<false>(e) : isoEventSeconds<true>(e);
+        if (seconds == INT_MIN) return false;
+        const int64_t date = !std::memcmp(e,a,10) ? ad.ms : midnight(e);
         if (date == invalidTime) return false;
-        ts = date + 1000LL*(eventSeconds-offset);
-        if (ts < ctx.start || ts >= ctx.end) return false;
-        // ISO timestamps often share the exact same calendar date. Reuse the
-        // validated midnight even when an offset changes the event's UTC day.
-        const auto ingestDate = !std::memcmp(e,a,10) ? date : midnight(a);
-        ingest = ingestDate + 1000LL*ingestSeconds;
+        ts = date + 1000LL * seconds;
     } else {
-        ts=timestamp(event);
-        if (ts < ctx.start || ts >= ctx.end) return false;
-        ingest=arrival.size()==20 ? validIngest(a) : timestamp(arrival);
+        ts = timestamp(event);
     }
-    return ingest-dayMs <= ts;
+    if (ts < ctx.start || ts >= ctx.end) return false;
+    if (ts >= ad.ms) return true;
+    const int64_t cutoff = ts + dayMs;
+    if (cutoff < ad.ms) return false;
+    return 1000LL * clockSeconds<false>(a+11) <= cutoff - ad.ms;
 }
 
 // Malformed lines and empty IDs never take part in deduplication. Every other
@@ -468,9 +511,10 @@ inline bool pairedClocks(const char* event, const char* ingest,
     out.id = Key::from(f[0]);
     out.valid = false;
     out.arrival = invalidTime;
+    out.order = missingOrder;
     if (f[1].empty() || f[5].empty()) return true;
     int64_t ts;
-    if (!eventTimes(f[2], f[3], ctx, ts, out.arrival)) return true;
+    if (!eventTimes(f[2], f[3], ctx, ts, out)) return true;
     uint32_t price = 0, category = 0;
     if (f[4] == "purchase") {
         auto priceEnd = f[6].data() + f[6].size();
@@ -653,13 +697,14 @@ inline bool parsePrepared(const PreparedMasks &packed, const Context &ctx, Parse
     out.id = inlineAsciiKey(p + h.id, h.idLen);
     out.valid = false;
     out.arrival = invalidTime;
+    out.order = missingOrder;
     if (!t.productLen || !h.userLen)
         return true;
     unsigned e2 = 30u + std::countr_zero(mc), a = e2 + 1 + t.quoted;
     const char *tail = p + n - 30;
     int64_t ts;
     if (!eventTimes({p + h.event, e2 - h.event - h.quoted}, {p + a, n - 30 + t.arrivalEnd - a}, ctx, ts,
-                    out.arrival))
+                    out))
         return true;
     uint32_t price = 0, category = 0;
     if (t.kindLen == 4) {
@@ -697,7 +742,7 @@ inline int64_t ingestTime(std::string_view text) {
     return true;
 }
 
-inline bool parseClick(std::string_view line, const Context &ctx, Click &row) {
+[[gnu::noinline]] bool longPrefixClick(std::string_view line, const Context &ctx, Click &row) {
     size_t n = line.size();
     if (n < 32 || n > 64)
         return otherClick(line, ctx, row);
@@ -730,6 +775,62 @@ inline bool parseClick(std::string_view line, const Context &ctx, Click &row) {
     row = {inlineAsciiKey(p + e0 + 1 + t1, userLen), inlineAsciiKey(p + t0, idLen), ts, campaign};
     return true;
 }
+
+// A common click ends with a UTC timestamp. A single vector covers its
+// separators, month/day digits and complete clock (the year is checked by
+// the day cache). The generic parser also accepts numeric 20-byte fields.
+inline int64_t clickTime(const char* p, size_t n) {
+    if (n == 13) return decimal13(p);
+    if (n != 20 || p[4] != '-') return timestamp({p,n});
+    const auto raw = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p+4));
+    const auto digits = _mm_sub_epi8(raw,_mm_setr_epi8(
+        '-','0','0','-','0','0','T','0','0',':','0','0',':','0','0','Z'));
+    const auto excess = _mm_subs_epu8(digits,
+        _mm_setr_epi8(0,9,9,0,9,9,0,2,9,0,5,9,0,5,9,0));
+    if (!_mm_testz_si128(excess, excess) || hourTooLarge(p+11)) return invalidTime;
+    const auto clock = _mm_shuffle_epi8(digits,
+        _mm_setr_epi8(7,8,10,11,13,14,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1));
+    const auto pairs = _mm_maddubs_epi16(clock, _mm_set1_epi16(0x010a));
+    const auto weighted = _mm_madd_epi16(pairs, _mm_setr_epi16(3600,60,1,0,0,0,0,0));
+    const int seconds = _mm_cvtsi128_si32(_mm_add_epi32(weighted,_mm_srli_si128(weighted,4)));
+    const int64_t date = midnight(p);
+    return date == invalidTime ? invalidTime : date + 1000LL * seconds;
+}
+
+inline bool parseClick(std::string_view line, const Context& ctx, Click& row) {
+    const char* p = line.data();
+    if (line.size() < 32) return otherClick(line,ctx,row);
+    const auto head = classify32(p);
+    uint32_t second = head.comma & (head.comma-1);
+    uint32_t third = second & (second-1);
+    if (!third) return longPrefixClick(line,ctx,row);
+    if (head.comma & 1) return false;
+    const unsigned c0 = std::countr_zero(head.comma);
+    const unsigned c1 = std::countr_zero(second);
+    const unsigned c2 = std::countr_zero(third);
+    const uint32_t three = head.comma ^ (third & (third-1));
+    const uint32_t starts = 1u | ((three ^ (third & -third)) << 1);
+    const uint32_t ends = three >> 1;
+    const uint32_t quotes = _bzhi_u32(head.quote,c2);
+    const uint32_t opened = _pext_u32(quotes,starts);
+    if (opened != _pext_u32(quotes,ends) || (quotes & ~(starts ^ ends))) return false;
+    const unsigned q0 = opened & 1, q1 = (opened >> 1) & 1, q2 = opened >> 2;
+    const unsigned idLen = c0-2*q0, userLen = c1-c0-1-2*q1;
+    if (!idLen || !userLen) return false;
+
+    // Everything after the third comma is the final field. Both numeric and
+    // ISO timestamp parsers reject any interior quote or extra comma there.
+    const size_t tail = line.size() - c2 - 1;
+    if (!tail) return false;
+    const bool qt = p[c2+1] == '"';
+    if (qt && (tail < 2 || line.back() != '"')) return false;
+    const int64_t time = clickTime(p+c2+1+qt,tail-2*qt);
+    if (time < ctx.start-7*dayMs || time >= ctx.end) return false;
+    const auto campaign = ctx.campaigns.lookup({p+c1+1+q2,c2-c1-1-2*q2},p+line.size());
+    if (campaign == UINT32_MAX) return false;
+    row = {inlineAsciiKey(p+c0+1+q1,userLen),inlineAsciiKey(p+q0,idLen),time,campaign};
+    return true;
+}
 struct Source {
     std::vector<InputChunk> spans;
     std::vector<uint64_t> starts;            // global offset of each event file
@@ -747,7 +848,7 @@ struct Source {
 int64_t arrival(uint64_t info, const Reader& reader, const Source& source, int64_t origin) {
     const uint32_t low = info;
     if (low < sourceTag || low == invalidArrivalTag)
-        return static_cast<int64_t>(uint64_t(origin) + (info >> 32) - (uint64_t{1} << 31));
+        return decodeOrder(info >> 32, origin);
     const uint64_t ref = specialValue(info);
     if (low >= slowTag) return reader.slow[ref].arrival;
     auto [line,limit] = source.locate(ref);
@@ -756,6 +857,19 @@ int64_t arrival(uint64_t info, const Reader& reader, const Source& source, int64
     if (!csv(std::string_view(line,(newline ? newline : limit)-line), fields))
         throw std::logic_error("Source line changed");
     return ingestTime(fields[3]);
+}
+
+inline bool compactArrival(uint64_t info) {
+    const uint32_t low = info;
+    return low < sourceTag || low == invalidArrivalTag;
+}
+inline bool earlierArrival(uint64_t a, const Reader& ra, uint64_t b, const Reader& rb,
+                           const Source& source, int64_t origin) {
+    const bool ac = compactArrival(a), bc = compactArrival(b);
+    if (ac && bc) return (a >> 32) < (b >> 32);
+    const int64_t at = ac ? decodeOrder(a >> 32, origin) : arrival(a,ra,source,origin);
+    const int64_t bt = bc ? decodeOrder(b >> 32, origin) : arrival(b,rb,source,origin);
+    return at < bt;
 }
 
 void invalidate(uint64_t info, Reader& reader) {
@@ -827,10 +941,7 @@ bool compactOwners(size_t shard, size_t count, int64_t origin, const Source& sou
                 const auto& priorPiece = pieces[ref / stride];
                 const auto& prior = priorPiece.rows[ref % stride];
                 if (!(prior.id == row.id)) continue;
-                const bool inlineTimes = (uint32_t(row.info) | uint32_t(prior.info)) < sourceTag;
-                const bool earlier = inlineTimes ? (row.info >> 32) < (prior.info >> 32)
-                    : arrival(row.info,*piece.reader,source,origin) <
-                      arrival(prior.info,*priorPiece.reader,source,origin);
+                const bool earlier = earlierArrival(row.info,*piece.reader,prior.info,*priorPiece.reader,source,origin);
                 if (earlier) {
                     invalidate(prior.info, *priorPiece.reader);
                     owners[at] = current;
@@ -891,10 +1002,7 @@ void deduplicate(size_t shard, int64_t arrivalOrigin, const Source& source,
                     continue;
                 }
                 Winner& old = slots[pos];
-                const bool inlineTimes = (uint32_t(row.info) | uint32_t(old.row.info)) < sourceTag;
-                const bool earlier = inlineTimes ? (row.info >> 32) < (old.row.info >> 32)
-                    : arrival(row.info,*reader,source,arrivalOrigin) <
-                      arrival(old.row.info,*old.reader,source,arrivalOrigin);
+                const bool earlier = earlierArrival(row.info,*reader,old.row.info,*old.reader,source,arrivalOrigin);
                 if (earlier) {
                     invalidate(old.row.info,*old.reader);
                     old = {row,reader.get()};
@@ -981,8 +1089,7 @@ void ingest(const Context& ctx, const std::vector<std::string_view>& eventFiles,
     // Raw and canonical buckets share high hash bits, so most rows can stay
     // in their original blocks while a worker probes its identity-table slice.
     const size_t parts = out.size();
-    const int64_t arrivalOrigin = std::clamp<int64_t>(ctx.start, INT64_MIN + (int64_t{1} << 31),
-                                                     INT64_MAX - INT32_MAX);
+    const int64_t arrivalOrigin = orderOrigin(ctx.start);
     const unsigned shift = 63 - std::countr_zero(parts);
     // Use more ID partitions than user partitions so a worker's duplicate bitmap fits in cache.
     const size_t idShards = std::clamp<size_t>(std::bit_ceil(bytes >> 21), 1, 1024);
@@ -995,6 +1102,7 @@ void ingest(const Context& ctx, const std::vector<std::string_view>& eventFiles,
     parallel(readerCount, readerCount, [&](size_t r) {
         readers[r] = std::make_unique<Reader>(parts, idShards);
         Reader& reader = *readers[r];
+        readerOrderOrigin = arrivalOrigin;
         ParsedEvent event;
         Click click;
         for (;;) {
@@ -1016,17 +1124,17 @@ void ingest(const Context& ctx, const std::vector<std::string_view>& eventFiles,
                     if (event.valid) {
                         const auto bucket = static_cast<uint32_t>(partOf(event.user.hash()));
                         const uint32_t index = reader.events.add(bucket,Event::pack(event.user,ctx.start,event.row));
-                        info = location(reader,event.arrival,arrivalOrigin,bucket,index);
+                        info = location(reader,event,arrivalOrigin,bucket,index);
                     } else {
                         // A row rejected before timestamp validation can still be the
                         // earliest copy. Cache its arrival while the CSV is resident.
-                        if (event.arrival == invalidTime) {
+                        if (event.order == missingOrder && event.arrival == invalidTime) {
                             std::array<std::string_view,7> fields;
-                            if (eventFields(line, fields)) event.arrival = ingestTime(fields[3]);
+                            if (eventFields(line, fields) && fields[3].size() == 20)
+                                rankArrival(fields[3].data(), event);
                         }
-                        const uint64_t relative = relativeArrival(event.arrival,arrivalOrigin);
-                        info = event.arrival != invalidTime && relative <= UINT32_MAX
-                             ? (relative << 32) | invalidArrivalTag : special(offset,sourceTag);
+                        info = event.order != missingOrder
+                             ? (event.order << 32) | invalidArrivalTag : special(offset,sourceTag);
                     }
                     reader.ids.add(idShard, IdRecord{event.id, info});
                 };

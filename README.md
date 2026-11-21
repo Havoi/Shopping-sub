@@ -21,6 +21,13 @@ still win deduplication. Large partitions and long probe chains use the
 general deduplicator. Compiler training uses synthetic inputs created during
 the build.
 
+Each compact arrival stores the UTC day and six clock digits in chronological
+order. Most duplicate comparisons can use that order directly. The parser
+converts the clock to milliseconds when a row crosses a lateness boundary
+or when comparing to a full-width arrival. For event timestamps with UTC
+offsets, SIMD instructions check the local clock and offset together. The
+Parquet writer packs day and count values directly into its encoded pages.
+
 The image starts a compiled executable with no arguments. Dependencies are
 installed during the build. Runtime diagnostics go to stderr. Input dates,
 identities, products, campaigns, and file counts all come from the mounted data.

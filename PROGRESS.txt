@@ -5,7 +5,36 @@ Submission and targets
 [x] Start the attributed C++ branch from public revision dd510ea. Verify
     both output tables on 49 reference datasets and two further edge cases.
 [x] Compare candidate builds on 20M and 60M events. The selected revision
-    is on perf/public-cpp. Its portal score is pending.
+    is on perf/public-cpp. The team reported 0.63 s for d23a4e4.
+[x] Establish d23a4e4 as the control for the next submission.
+[x] Reserve an unseen 20M-event, 5M-click generator seed (51489177)
+    before timing candidate builds. Use the same scored image as control.
+[x] Check the compact UTC arrival order on every second of three dates,
+    including the day before the epoch, and check the 24-hour boundary.
+[x] Compare the parser on two tuning seeds. Median container time moved
+    from 0.881 to 0.818 s on seed 67159043 and 0.840 to 0.798 s on seed 73.
+[x] Compare five finalists against d23a4e4. Select the build with fused
+    timestamp and click parsing and direct Parquet packing before opening
+    the reserved input. Tuning medians for the two images were 0.763 and
+    0.769 s at 20M, and 5.691 and 4.723 s at 60M (seed 99).
+[x] Time the selected release in fresh containers on eight pinned CPU
+    threads with a 6 GiB memory limit. All times are median start-to-exit.
+    Input                            d23a4e4       Candidate     Runs/image
+    20M events, seed 51489177         0.876 s         0.912 s          8
+    20M events, seed 271828           0.853 s         0.844 s          8
+    60M events, seed 99               4.801 s         5.303 s          5
+    The 20M inputs were warm. The 60M input exceeds the container limit
+    when combined with working memory; cache residency can vary between runs.
+    The 20M ratios applied to the reported 0.630 s project 0.62 to 0.66 s.
+    Portal performance for this revision is pending.
+[x] Match both tables on the 36 official fixtures, the dev answer and 14
+    additional reference datasets. On the three timed inputs, compare every
+    key and column with the scored image. The user/day row counts are
+    2,250,376, 2,250,629 and 6,648,247. Each has 28,014 campaign/day rows.
+[x] Pass 12 native test programs and check the normal launcher on emulated
+    Skylake Server, Haswell and Nehalem, including the older-CPU fallback.
+[ ] Reach a portal time below 0.300 s. From 0.630 s this requires saving
+    more than 330 ms, or improving throughput by more than 2.10 times.
 [x] Implement the rules and publish the original solution, d6783e0.
     The team reported 8 seconds and rank 178.
 [x] Publish 36e2f49. The team reported 1.52 seconds on the practice portal.
